@@ -44,3 +44,10 @@ To learn more about how we handle bug reports, please read the [bug triage guide
 
 ## License
 [Mozilla Public License v2.0](https://github.com/hashicorp/terraform/blob/main/LICENSE)
+https://github.com/alfonsof/terraform-aws-examples
+https://github.com/hashicorp/terraform-provider-aws/tree/main/examples
+https://github.com/orgs/terraform-aws-modules/repositories?page=1&type=all
+https://github.com/diodonfrost/terraform-aws-examples
+https://github.com/futurice/terraform-examples
+https://github.com/cloudposse/terraform-aws-ec2-instance
+https://containersolutions.github.io/terraform-examples/examples/aws/aws.html
