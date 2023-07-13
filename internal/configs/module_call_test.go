@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package configs
 
 import (
@@ -45,7 +48,7 @@ func TestLoadModuleCall(t *testing.T) {
 		{
 			Name: "bar",
 			SourceAddr: addrs.ModuleSourceRegistry{
-				PackageAddr: addrs.ModuleRegistryPackage{
+				Package: addrs.ModuleRegistryPackage{
 					Host:         addrs.DefaultModuleRegistryHost,
 					Namespace:    "hashicorp",
 					Name:         "bar",
@@ -68,7 +71,7 @@ func TestLoadModuleCall(t *testing.T) {
 		{
 			Name: "baz",
 			SourceAddr: addrs.ModuleSourceRemote{
-				PackageAddr: addrs.ModulePackage("git::https://example.com/"),
+				Package: addrs.ModulePackage("git::https://example.com/"),
 			},
 			SourceAddrRaw: "git::https://example.com/",
 			SourceSet:     true,

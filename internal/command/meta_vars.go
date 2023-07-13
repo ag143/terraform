@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package command
 
 import (
@@ -102,6 +105,14 @@ func (m *Meta) collectVariableValues() (map[string]backend.UnparsedVariableValue
 			}
 			name := raw[:eq]
 			rawVal := raw[eq+1:]
+			if strings.HasSuffix(name, " ") {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Invalid -var option",
+					fmt.Sprintf("Variable name %q is invalid due to trailing space. Did you mean -var=\"%s=%s\"?", name, strings.TrimSuffix(name, " "), strings.TrimPrefix(rawVal, " ")),
+				))
+				continue
+			}
 			ret[name] = unparsedVariableValueString{
 				str:        rawVal,
 				name:       name,

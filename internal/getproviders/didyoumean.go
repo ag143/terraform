@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package getproviders
 
 import (
@@ -40,7 +43,7 @@ import (
 // renaming suggestion even if one would've been available for a completed
 // request.
 func MissingProviderSuggestion(ctx context.Context, addr addrs.Provider, source Source, reqs Requirements) addrs.Provider {
-	if !addr.IsDefault() {
+	if !addrs.IsDefaultProvider(addr) {
 		return addr
 	}
 

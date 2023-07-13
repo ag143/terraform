@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package configs
 
 import (
@@ -7,6 +10,7 @@ import (
 
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/getproviders"
@@ -90,6 +94,14 @@ type ModuleRequirements struct {
 	SourceDir    string
 	Requirements getproviders.Requirements
 	Children     map[string]*ModuleRequirements
+	Tests        map[string]*TestFileModuleRequirements
+}
+
+// TestFileModuleRequirements maps the runs for a given test file to the module
+// requirements for that run block.
+type TestFileModuleRequirements struct {
+	Requirements getproviders.Requirements
+	Runs         map[string]*ModuleRequirements
 }
 
 // NewEmptyConfig constructs a single-node configuration tree with an empty
@@ -289,7 +301,7 @@ func (c *Config) VerifyDependencySelections(depLocks *depsfile.Locks) []error {
 // may be incomplete.
 func (c *Config) ProviderRequirements() (getproviders.Requirements, hcl.Diagnostics) {
 	reqs := make(getproviders.Requirements)
-	diags := c.addProviderRequirements(reqs, true)
+	diags := c.addProviderRequirements(reqs, true, true)
 
 	return reqs, diags
 }
@@ -301,7 +313,7 @@ func (c *Config) ProviderRequirements() (getproviders.Requirements, hcl.Diagnost
 // may be incomplete.
 func (c *Config) ProviderRequirementsShallow() (getproviders.Requirements, hcl.Diagnostics) {
 	reqs := make(getproviders.Requirements)
-	diags := c.addProviderRequirements(reqs, false)
+	diags := c.addProviderRequirements(reqs, false, true)
 
 	return reqs, diags
 }
@@ -314,7 +326,7 @@ func (c *Config) ProviderRequirementsShallow() (getproviders.Requirements, hcl.D
 // may be incomplete.
 func (c *Config) ProviderRequirementsByModule() (*ModuleRequirements, hcl.Diagnostics) {
 	reqs := make(getproviders.Requirements)
-	diags := c.addProviderRequirements(reqs, false)
+	diags := c.addProviderRequirements(reqs, false, false)
 
 	children := make(map[string]*ModuleRequirements)
 	for name, child := range c.Children {
@@ -324,11 +336,37 @@ func (c *Config) ProviderRequirementsByModule() (*ModuleRequirements, hcl.Diagno
 		diags = append(diags, childDiags...)
 	}
 
+	tests := make(map[string]*TestFileModuleRequirements)
+	for name, test := range c.Module.Tests {
+		testReqs := &TestFileModuleRequirements{
+			Requirements: make(getproviders.Requirements),
+			Runs:         make(map[string]*ModuleRequirements),
+		}
+
+		for _, provider := range test.Providers {
+			diags = append(diags, c.addProviderRequirementsFromProviderBlock(testReqs.Requirements, provider)...)
+		}
+
+		for _, run := range test.Runs {
+			if run.ConfigUnderTest == nil {
+				continue
+			}
+
+			runReqs, runDiags := run.ConfigUnderTest.ProviderRequirementsByModule()
+			runReqs.Name = run.Name
+			testReqs.Runs[run.Name] = runReqs
+			diags = append(diags, runDiags...)
+		}
+
+		tests[name] = testReqs
+	}
+
 	ret := &ModuleRequirements{
 		SourceAddr:   c.SourceAddr,
 		SourceDir:    c.Module.SourceDir,
 		Requirements: reqs,
 		Children:     children,
+		Tests:        tests,
 	}
 
 	return ret, diags
@@ -338,7 +376,7 @@ func (c *Config) ProviderRequirementsByModule() (*ModuleRequirements, hcl.Diagno
 // implementation, gradually mutating a shared requirements object to
 // eventually return. If the recurse argument is true, the requirements will
 // include all descendant modules; otherwise, only the specified module.
-func (c *Config) addProviderRequirements(reqs getproviders.Requirements, recurse bool) hcl.Diagnostics {
+func (c *Config) addProviderRequirements(reqs getproviders.Requirements, recurse, tests bool) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	// First we'll deal with the requirements directly in _our_ module...
@@ -391,43 +429,163 @@ func (c *Config) addProviderRequirements(reqs getproviders.Requirements, recurse
 		}
 		reqs[fqn] = nil
 	}
+	for _, i := range c.Module.Import {
+		implied, err := addrs.ParseProviderPart(i.To.Resource.Resource.ImpliedProvider())
+		if err == nil {
+			provider := c.Module.ImpliedProviderForUnqualifiedType(implied)
+			if _, exists := reqs[provider]; exists {
+				// Explicit dependency already present
+				continue
+			}
+			reqs[provider] = nil
+		}
+		// We don't return a diagnostic here, because the invalid address will
+		// have been caught elsewhere.
+	}
+
+	// Import blocks that are generating config may also have a custom provider
+	// meta argument. Like the provider meta argument used in resource blocks,
+	// we use this opportunity to load any implicit providers.
+	//
+	// We'll also use this to validate that import blocks and targeted resource
+	// blocks agree on which provider they should be using. If they don't agree,
+	// this will be because the user has written explicit provider arguments
+	// that don't agree and we'll get them to fix it.
+	for _, i := range c.Module.Import {
+		if len(i.To.Module) > 0 {
+			// All provider information for imports into modules should come
+			// from the module block, so we don't need to load anything for
+			// import targets within modules.
+			continue
+		}
+
+		if target, exists := c.Module.ManagedResources[i.To.String()]; exists {
+			// This means the information about the provider for this import
+			// should come from the resource block itself and not the import
+			// block.
+			//
+			// In general, we say that you shouldn't set the provider attribute
+			// on import blocks in this case. But to make config generation
+			// easier, we will say that if it is set in both places and it's the
+			// same then that is okay.
+
+			if i.ProviderConfigRef != nil {
+				if target.ProviderConfigRef == nil {
+					// This means we have a provider specified in the import
+					// block and not in the resource block. This isn't the right
+					// way round so let's consider this a failure.
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Invalid import provider argument",
+						Detail:   "The provider argument can only be specified in import blocks that will generate configuration.\n\nUse the provider argument in the target resource block to configure the provider for a resource with explicit provider configuration.",
+						Subject:  i.ProviderDeclRange.Ptr(),
+					})
+					continue
+				}
+
+				if i.ProviderConfigRef.Name != target.ProviderConfigRef.Name || i.ProviderConfigRef.Alias != target.ProviderConfigRef.Alias {
+					// This means we have a provider specified in both the
+					// import block and the resource block, and they disagree.
+					// This is bad as Terraform now has different instructions
+					// about which provider to use.
+					//
+					// The general guidance is that only the resource should be
+					// specifying the provider as the import block provider
+					// attribute is just for generating config. So, let's just
+					// tell the user to only set the provider argument in the
+					// resource.
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Invalid import provider argument",
+						Detail:   "The provider argument can only be specified in import blocks that will generate configuration.\n\nUse the provider argument in the target resource block to configure the provider for a resource with explicit provider configuration.",
+						Subject:  i.ProviderDeclRange.Ptr(),
+					})
+					continue
+				}
+			}
+
+			// All the provider information should come from the target resource
+			// which has already been processed, so skip the rest of this
+			// processing.
+			continue
+		}
+
+		// Otherwise we are generating config for the resource being imported,
+		// so all the provider information must come from this import block.
+		fqn := i.Provider
+		if _, exists := reqs[fqn]; exists {
+			// Explicit dependency already present
+			continue
+		}
+		reqs[fqn] = nil
+	}
 
 	// "provider" block can also contain version constraints
 	for _, provider := range c.Module.ProviderConfigs {
-		fqn := c.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{LocalName: provider.Name})
-		if _, ok := reqs[fqn]; !ok {
-			// We'll at least have an unconstrained dependency then, but might
-			// add to this in the loop below.
-			reqs[fqn] = nil
-		}
-		if provider.Version.Required != nil {
-			// The model of version constraints in this package is still the
-			// old one using a different upstream module to represent versions,
-			// so we'll need to shim that out here for now. The two parsers
-			// don't exactly agree in practice 🙄 so this might produce new errors.
-			// TODO: Use the new parser throughout this package so we can get the
-			// better error messages it produces in more situations.
-			constraints, err := getproviders.ParseVersionConstraints(provider.Version.Required.String())
-			if err != nil {
-				diags = diags.Append(&hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Invalid version constraint",
-					// The errors returned by ParseVersionConstraint already include
-					// the section of input that was incorrect, so we don't need to
-					// include that here.
-					Detail:  fmt.Sprintf("Incorrect version constraint syntax: %s.", err.Error()),
-					Subject: provider.Version.DeclRange.Ptr(),
-				})
+		moreDiags := c.addProviderRequirementsFromProviderBlock(reqs, provider)
+		diags = append(diags, moreDiags...)
+	}
+
+	// We may have provider blocks and required_providers set in some testing
+	// files.
+	if tests {
+		for _, file := range c.Module.Tests {
+			for _, provider := range file.Providers {
+				moreDiags := c.addProviderRequirementsFromProviderBlock(reqs, provider)
+				diags = append(diags, moreDiags...)
 			}
-			reqs[fqn] = append(reqs[fqn], constraints...)
+
+			if recurse {
+				// Then we'll also look for requirements in testing modules.
+				for _, run := range file.Runs {
+					if run.ConfigUnderTest != nil {
+						moreDiags := run.ConfigUnderTest.addProviderRequirements(reqs, true, false)
+						diags = append(diags, moreDiags...)
+					}
+				}
+			}
 		}
 	}
 
 	if recurse {
 		for _, childConfig := range c.Children {
-			moreDiags := childConfig.addProviderRequirements(reqs, true)
+			moreDiags := childConfig.addProviderRequirements(reqs, true, false)
 			diags = append(diags, moreDiags...)
 		}
+	}
+
+	return diags
+}
+
+func (c *Config) addProviderRequirementsFromProviderBlock(reqs getproviders.Requirements, provider *Provider) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+
+	fqn := c.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{LocalName: provider.Name})
+	if _, ok := reqs[fqn]; !ok {
+		// We'll at least have an unconstrained dependency then, but might
+		// add to this in the loop below.
+		reqs[fqn] = nil
+	}
+	if provider.Version.Required != nil {
+		// The model of version constraints in this package is still the
+		// old one using a different upstream module to represent versions,
+		// so we'll need to shim that out here for now. The two parsers
+		// don't exactly agree in practice 🙄 so this might produce new errors.
+		// TODO: Use the new parser throughout this package so we can get the
+		// better error messages it produces in more situations.
+		constraints, err := getproviders.ParseVersionConstraints(provider.Version.Required.String())
+		if err != nil {
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid version constraint",
+				// The errors returned by ParseVersionConstraint already include
+				// the section of input that was incorrect, so we don't need to
+				// include that here.
+				Detail:  fmt.Sprintf("Incorrect version constraint syntax: %s.", err.Error()),
+				Subject: provider.Version.DeclRange.Ptr(),
+			})
+		}
+		reqs[fqn] = append(reqs[fqn], constraints...)
 	}
 
 	return diags
@@ -554,4 +712,108 @@ func (c *Config) ProviderForConfigAddr(addr addrs.LocalProviderConfig) addrs.Pro
 		return provider.Type
 	}
 	return c.ResolveAbsProviderAddr(addr, addrs.RootModule).Provider
+}
+
+func (c *Config) CheckCoreVersionRequirements() hcl.Diagnostics {
+	var diags hcl.Diagnostics
+
+	diags = diags.Extend(c.Module.CheckCoreVersionRequirements(c.Path, c.SourceAddr))
+
+	for _, c := range c.Children {
+		childDiags := c.CheckCoreVersionRequirements()
+		diags = diags.Extend(childDiags)
+	}
+
+	return diags
+}
+
+// TransformForTest prepares the config to execute the given test.
+//
+// This function directly edits the config that is to be tested, and returns a
+// function that will reset the config back to its original state.
+//
+// Tests will call this before they execute, and then call the deferred function
+// to reset the config before the next test.
+func (c *Config) TransformForTest(run *TestRun, file *TestFile) (func(), hcl.Diagnostics) {
+	var diags hcl.Diagnostics
+
+	// Currently, we only need to override the provider settings.
+	//
+	// We can have a set of providers defined within the config, we can also
+	// have a set of providers defined within the test file. Then the run can
+	// also specify a set of overrides that tell Terraform exactly which
+	// providers from the test file to apply into the config.
+	//
+	// The process here is as follows:
+	//   1. Take all the providers in the original config keyed by name.alias,
+	//      we call this `previous`
+	//   2. Copy them all into a new map, we call this `next`.
+	//   3a. If the run has configuration specifying provider overrides, we copy
+	//       only the specified providers from the test file into `next`. While
+	//       doing this we ensure to preserve the name and alias from the
+	//       original config.
+	//   3b. If the run has no override configuration, we copy all the providers
+	//       from the test file into `next`, overriding all providers with name
+	//       collisions from the original config.
+	//   4. We then modify the original configuration so that the providers it
+	//      holds are the combination specified by the original config, the test
+	//      file and the run file.
+	//   5. We then return a function that resets the original config back to
+	//      its original state. This can be called by the surrounding test once
+	//      completed so future run blocks can safely execute.
+
+	// First, initialise `previous` and `next`. `previous` contains a backup of
+	// the providers from the original config. `next` contains the set of
+	// providers that will be used by the test. `next` starts with the set of
+	// providers from the original config.
+	previous := c.Module.ProviderConfigs
+	next := make(map[string]*Provider)
+	for key, value := range previous {
+		next[key] = value
+	}
+
+	if run != nil && len(run.Providers) > 0 {
+		// Then we'll only copy over and overwrite the specific providers asked
+		// for by this run block.
+
+		for _, ref := range run.Providers {
+
+			testProvider, ok := file.Providers[ref.InParent.String()]
+			if !ok {
+				// Then this reference was invalid as we didn't have the
+				// specified provider in the parent. This should have been
+				// caught earlier in validation anyway so is unlikely to happen.
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  fmt.Sprintf("Missing provider definition for %s", ref.InParent.String()),
+					Detail:   "This provider block references a provider definition that does not exist.",
+					Subject:  ref.InParent.NameRange.Ptr(),
+				})
+				continue
+			}
+
+			next[ref.InChild.String()] = &Provider{
+				Name:       ref.InChild.Name,
+				NameRange:  ref.InChild.NameRange,
+				Alias:      ref.InChild.Alias,
+				AliasRange: ref.InChild.AliasRange,
+				Version:    testProvider.Version,
+				Config:     testProvider.Config,
+				DeclRange:  testProvider.DeclRange,
+			}
+
+		}
+	} else {
+		// Otherwise, let's copy over and overwrite all providers specified by
+		// the test file itself.
+		for key, provider := range file.Providers {
+			next[key] = provider
+		}
+	}
+
+	c.Module.ProviderConfigs = next
+	return func() {
+		// Reset the original config within the returned function.
+		c.Module.ProviderConfigs = previous
+	}, diags
 }

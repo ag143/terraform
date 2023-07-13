@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package lang
 
 import (
@@ -364,13 +367,14 @@ func TestScopeEvalContext(t *testing.T) {
 				return
 			}
 
-			refs, refsDiags := ReferencesInExpr(expr)
+			refs, refsDiags := ReferencesInExpr(addrs.ParseRef, expr)
 			if refsDiags.HasErrors() {
 				t.Fatal(refsDiags.Err())
 			}
 
 			scope := &Scope{
-				Data: data,
+				Data:     data,
+				ParseRef: addrs.ParseRef,
 
 				// "self" will just be an arbitrary one of the several resource
 				// instances we have in our test dataset.
@@ -677,7 +681,8 @@ func TestScopeExpandEvalBlock(t *testing.T) {
 
 			body := file.Body
 			scope := &Scope{
-				Data: data,
+				Data:     data,
+				ParseRef: addrs.ParseRef,
 			}
 
 			body, expandDiags := scope.ExpandBlock(body, schema)
@@ -823,7 +828,8 @@ func TestScopeEvalSelfBlock(t *testing.T) {
 			body := file.Body
 
 			scope := &Scope{
-				Data: data,
+				Data:     data,
+				ParseRef: addrs.ParseRef,
 			}
 
 			gotVal, ctxDiags := scope.EvalSelfBlock(body, test.Self, schema, test.KeyData)

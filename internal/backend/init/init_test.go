@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package init
 
 import (
@@ -18,14 +21,10 @@ func TestInit_backend(t *testing.T) {
 		{"azurerm", "*azure.Backend"},
 		{"consul", "*consul.Backend"},
 		{"cos", "*cos.Backend"},
-		{"etcdv3", "*etcd.Backend"},
 		{"gcs", "*gcs.Backend"},
 		{"inmem", "*inmem.Backend"},
-		{"manta", "*manta.Backend"},
 		{"pg", "*pg.Backend"},
 		{"s3", "*s3.Backend"},
-		{"swift", "*swift.Backend"},
-		{"azure", "init.deprecatedBackendShim"},
 	}
 
 	// Make sure we get the requested backend

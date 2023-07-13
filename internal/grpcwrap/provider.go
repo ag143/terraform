@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package grpcwrap
 
 import (
@@ -57,6 +60,10 @@ func (p *provider) GetSchema(_ context.Context, req *tfplugin5.GetProviderSchema
 			Version: dat.Version,
 			Block:   convert.ConfigSchemaToProto(dat.Block),
 		}
+	}
+
+	resp.ServerCapabilities = &tfplugin5.GetProviderSchema_ServerCapabilities{
+		PlanDestroy: p.schema.ServerCapabilities.PlanDestroy,
 	}
 
 	// include any diagnostics from the original GetSchema call

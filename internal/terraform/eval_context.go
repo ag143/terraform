@@ -1,8 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package terraform
 
 import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/checks"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/instances"
 	"github.com/hashicorp/terraform/internal/lang"
@@ -53,7 +57,7 @@ type EvalContext interface {
 	//
 	// This method expects an _absolute_ provider configuration address, since
 	// resources in one module are able to use providers from other modules.
-	ProviderSchema(addrs.AbsProviderConfig) (*ProviderSchema, error)
+	ProviderSchema(addrs.AbsProviderConfig) (providers.ProviderSchema, error)
 
 	// CloseProvider closes provider connections that aren't needed anymore.
 	//
@@ -124,7 +128,7 @@ type EvalContext interface {
 
 	// EvaluationScope returns a scope that can be used to evaluate reference
 	// addresses in this context.
-	EvaluationScope(self addrs.Referenceable, keyData InstanceKeyEvalData) *lang.Scope
+	EvaluationScope(self addrs.Referenceable, source addrs.Referenceable, keyData InstanceKeyEvalData) *lang.Scope
 
 	// SetRootModuleArgument defines the value for one variable of the root
 	// module. The caller must ensure that given value is a suitable
@@ -164,9 +168,9 @@ type EvalContext interface {
 	// the global state.
 	State() *states.SyncState
 
-	// Conditions returns the writer object that can be used to store condition
-	// block results as they are evaluated.
-	Conditions() *plans.ConditionsSync
+	// Checks returns the object that tracks the state of any custom checks
+	// declared in the configuration.
+	Checks() *checks.State
 
 	// RefreshState returns a wrapper object that provides safe concurrent
 	// access to the state used to store the most recently refreshed resource

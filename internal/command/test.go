@@ -3,728 +3,663 @@ package command
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
-	"log"
-	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 
-	ctyjson "github.com/zclconf/go-cty/cty/json"
+	"github.com/hashicorp/hcl/v2"
 
-	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/backend"
 	"github.com/hashicorp/terraform/internal/command/arguments"
-	"github.com/hashicorp/terraform/internal/command/format"
 	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/configs"
-	"github.com/hashicorp/terraform/internal/configs/configload"
-	"github.com/hashicorp/terraform/internal/depsfile"
-	"github.com/hashicorp/terraform/internal/initwd"
+	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/moduletest"
 	"github.com/hashicorp/terraform/internal/plans"
-	"github.com/hashicorp/terraform/internal/providercache"
-	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
-// TestCommand is the implementation of "terraform test".
 type TestCommand struct {
 	Meta
 }
 
-func (c *TestCommand) Run(rawArgs []string) int {
-	// Parse and apply global view arguments
-	common, rawArgs := arguments.ParseView(rawArgs)
-	c.View.Configure(common)
-
-	args, diags := arguments.ParseTest(rawArgs)
-	view := views.NewTest(c.View, args.Output)
-	if diags.HasErrors() {
-		view.Diagnostics(diags)
-		return 1
-	}
-
-	diags = diags.Append(tfdiags.Sourceless(
-		tfdiags.Warning,
-		`The "terraform test" command is experimental`,
-		"We'd like to invite adventurous module authors to write integration tests for their modules using this command, but all of the behaviors of this command are currently experimental and may change based on feedback.\n\nFor more information on the testing experiment, including ongoing research goals and avenues for feedback, see:\n    https://www.terraform.io/docs/language/modules/testing-experiment.html",
-	))
-
-	ctx, cancel := c.InterruptibleContext()
-	defer cancel()
-
-	results, moreDiags := c.run(ctx, args)
-	diags = diags.Append(moreDiags)
-
-	initFailed := diags.HasErrors()
-	view.Diagnostics(diags)
-	diags = view.Results(results)
-	resultsFailed := diags.HasErrors()
-	view.Diagnostics(diags) // possible additional errors from saving the results
-
-	var testsFailed bool
-	for _, suite := range results {
-		for _, component := range suite.Components {
-			for _, assertion := range component.Assertions {
-				if !assertion.Outcome.SuiteCanPass() {
-					testsFailed = true
-				}
-			}
-		}
-	}
-
-	// Lots of things can possibly have failed
-	if initFailed || resultsFailed || testsFailed {
-		return 1
-	}
-	return 0
-}
-
-func (c *TestCommand) run(ctx context.Context, args arguments.Test) (results map[string]*moduletest.Suite, diags tfdiags.Diagnostics) {
-	suiteNames, err := c.collectSuiteNames()
-	if err != nil {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"Error while searching for test configurations",
-			fmt.Sprintf("While attempting to scan the 'tests' subdirectory for potential test configurations, Terraform encountered an error: %s.", err),
-		))
-		return nil, diags
-	}
-
-	ret := make(map[string]*moduletest.Suite, len(suiteNames))
-	for _, suiteName := range suiteNames {
-		if ctx.Err() != nil {
-			// If the context has already failed in some way then we'll
-			// halt early and report whatever's already happened.
-			break
-		}
-		suite, moreDiags := c.runSuite(ctx, suiteName)
-		diags = diags.Append(moreDiags)
-		ret[suiteName] = suite
-	}
-
-	return ret, diags
-}
-
-func (c *TestCommand) runSuite(ctx context.Context, suiteName string) (*moduletest.Suite, tfdiags.Diagnostics) {
-	var diags tfdiags.Diagnostics
-	ret := moduletest.Suite{
-		Name:       suiteName,
-		Components: map[string]*moduletest.Component{},
-	}
-
-	// In order to make this initial round of "terraform test" pretty self
-	// contained while it's experimental, it's largely just mimicking what
-	// would happen when running the main Terraform workflow commands, which
-	// comes at the expense of a few irritants that we'll hopefully resolve
-	// in future iterations as the design solidifies:
-	// - We need to install remote modules separately for each of the
-	//   test suites, because we don't have any sense of a shared cache
-	//   of modules that multiple configurations can refer to at once.
-	// - We _do_ have a sense of a cache of remote providers, but it's fixed
-	//   at being specifically a two-level cache (global vs. directory-specific)
-	//   and so we can't easily capture a third level of "all of the test suites
-	//   for this module" that sits between the two. Consequently, we need to
-	//   dynamically choose between creating a directory-specific "global"
-	//   cache or using the user's existing global cache, to avoid any
-	//   situation were we'd be re-downloading the same providers for every
-	//   one of the test suites.
-	// - We need to do something a bit horrid in order to have our test
-	//   provider instance persist between the plan and apply steps, because
-	//   normally that is the exact opposite of what we want.
-	// The above notes are here mainly as an aid to someone who might be
-	// planning a subsequent phase of this R&D effort, to help distinguish
-	// between things we're doing here because they are valuable vs. things
-	// we're doing just to make it work without doing any disruptive
-	// refactoring.
-
-	suiteDirs, moreDiags := c.prepareSuiteDir(ctx, suiteName)
-	diags = diags.Append(moreDiags)
-	if diags.HasErrors() {
-		// Generate a special failure representing the test initialization
-		// having failed, since we therefore won'tbe able to run the actual
-		// tests defined inside.
-		ret.Components["(init)"] = &moduletest.Component{
-			Assertions: map[string]*moduletest.Assertion{
-				"(init)": {
-					Outcome:     moduletest.Error,
-					Description: "terraform init",
-					Message:     "failed to install test suite dependencies",
-					Diagnostics: diags,
-				},
-			},
-		}
-		return &ret, nil
-	}
-
-	// When we run the suite itself, we collect up diagnostics associated
-	// with individual components, so ret.Components may or may not contain
-	// failed/errored components after runTestSuite returns.
-	var finalState *states.State
-	ret.Components, finalState = c.runTestSuite(ctx, suiteDirs)
-
-	// Regardless of the success or failure of the test suite, if there are
-	// any objects left in the state then we'll generate a top-level error
-	// about each one to minimize the chance of the user failing to notice
-	// that there are leftover objects that might continue to cost money
-	// unless manually deleted.
-	for _, ms := range finalState.Modules {
-		for _, rs := range ms.Resources {
-			for instanceKey, is := range rs.Instances {
-				var objs []*states.ResourceInstanceObjectSrc
-				if is.Current != nil {
-					objs = append(objs, is.Current)
-				}
-				for _, obj := range is.Deposed {
-					objs = append(objs, obj)
-				}
-				for _, obj := range objs {
-					// Unfortunately we don't have provider schemas out here
-					// and so we're limited in what we can achieve with these
-					// ResourceInstanceObjectSrc values, but we can try some
-					// heuristicy things to try to give some useful information
-					// in common cases.
-					var k, v string
-					if ty, err := ctyjson.ImpliedType(obj.AttrsJSON); err == nil {
-						if approxV, err := ctyjson.Unmarshal(obj.AttrsJSON, ty); err == nil {
-							k, v = format.ObjectValueIDOrName(approxV)
-						}
-					}
-
-					var detail string
-					if k != "" {
-						// We can be more specific if we were able to infer
-						// an identifying attribute for this object.
-						detail = fmt.Sprintf(
-							"Due to errors during destroy, test suite %q has left behind an object for %s, with the following identity:\n    %s = %q\n\nYou will need to delete this object manually in the remote system, or else it may have an ongoing cost.",
-							suiteName,
-							rs.Addr.Instance(instanceKey),
-							k, v,
-						)
-					} else {
-						// If our heuristics for finding a suitable identifier
-						// failed then unfortunately we must be more vague.
-						// (We can't just print the entire object, because it
-						// might be overly large and it might contain sensitive
-						// values.)
-						detail = fmt.Sprintf(
-							"Due to errors during destroy, test suite %q has left behind an object for %s. You will need to delete this object manually in the remote system, or else it may have an ongoing cost.",
-							suiteName,
-							rs.Addr.Instance(instanceKey),
-						)
-					}
-					diags = diags.Append(tfdiags.Sourceless(
-						tfdiags.Error,
-						"Failed to clean up after tests",
-						detail,
-					))
-				}
-			}
-		}
-	}
-
-	return &ret, diags
-}
-
-func (c *TestCommand) prepareSuiteDir(ctx context.Context, suiteName string) (testCommandSuiteDirs, tfdiags.Diagnostics) {
-	var diags tfdiags.Diagnostics
-	configDir := filepath.Join("tests", suiteName)
-	log.Printf("[TRACE] terraform test: Prepare directory for suite %q in %s", suiteName, configDir)
-
-	suiteDirs := testCommandSuiteDirs{
-		SuiteName: suiteName,
-		ConfigDir: configDir,
-	}
-
-	// Before we can run a test suite we need to make sure that we have all of
-	// its dependencies available, so the following is essentially an
-	// abbreviated form of what happens during "terraform init", with some
-	// extra trickery in places.
-
-	// First, module installation. This will include linking in the module
-	// under test, but also includes grabbing the dependencies of that module
-	// if it has any.
-	suiteDirs.ModulesDir = filepath.Join(configDir, ".terraform", "modules")
-	os.MkdirAll(suiteDirs.ModulesDir, 0755) // if this fails then we'll ignore it and let InstallModules below fail instead
-	reg := c.registryClient()
-	moduleInst := initwd.NewModuleInstaller(suiteDirs.ModulesDir, reg)
-	_, moreDiags := moduleInst.InstallModules(ctx, configDir, true, nil)
-	diags = diags.Append(moreDiags)
-	if diags.HasErrors() {
-		return suiteDirs, diags
-	}
-
-	// The installer puts the files in a suitable place on disk, but we
-	// still need to actually load the configuration. We need to do this
-	// with a separate config loader because the Meta.configLoader instance
-	// is intended for interacting with the current working directory, not
-	// with the test suite subdirectories.
-	loader, err := configload.NewLoader(&configload.Config{
-		ModulesDir: suiteDirs.ModulesDir,
-		Services:   c.Services,
-	})
-	if err != nil {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"Failed to create test configuration loader",
-			fmt.Sprintf("Failed to prepare loader for test configuration %s: %s.", configDir, err),
-		))
-		return suiteDirs, diags
-	}
-	cfg, hclDiags := loader.LoadConfig(configDir)
-	diags = diags.Append(hclDiags)
-	if diags.HasErrors() {
-		return suiteDirs, diags
-	}
-	suiteDirs.Config = cfg
-
-	// With the full configuration tree available, we can now install
-	// the necessary providers. We'll use a separate local cache directory
-	// here, because the test configuration might have additional requirements
-	// compared to the module itself.
-	suiteDirs.ProvidersDir = filepath.Join(configDir, ".terraform", "providers")
-	os.MkdirAll(suiteDirs.ProvidersDir, 0755) // if this fails then we'll ignore it and operations below fail instead
-	localCacheDir := providercache.NewDir(suiteDirs.ProvidersDir)
-	providerInst := c.providerInstaller().Clone(localCacheDir)
-	if !providerInst.HasGlobalCacheDir() {
-		// If the user already configured a global cache directory then we'll
-		// just use it for caching the test providers too, because then we
-		// can potentially reuse cache entries they already have. However,
-		// if they didn't configure one then we'll still establish one locally
-		// in the working directory, which we'll then share across all tests
-		// to avoid downloading the same providers repeatedly.
-		cachePath := filepath.Join(c.DataDir(), "testing-providers") // note this is _not_ under the suite dir
-		err := os.MkdirAll(cachePath, 0755)
-		// If we were unable to create the directory for any reason then we'll
-		// just proceed without a cache, at the expense of repeated downloads.
-		// (With that said, later installing might end up failing for the
-		// same reason anyway...)
-		if err == nil || os.IsExist(err) {
-			cacheDir := providercache.NewDir(cachePath)
-			providerInst.SetGlobalCacheDir(cacheDir)
-		}
-	}
-	reqs, hclDiags := cfg.ProviderRequirements()
-	diags = diags.Append(hclDiags)
-	if diags.HasErrors() {
-		return suiteDirs, diags
-	}
-
-	// For test suites we only retain the "locks" in memory for the duration
-	// for one run, just to make sure that we use the same providers when we
-	// eventually run the test suite.
-	locks := depsfile.NewLocks()
-	evts := &providercache.InstallerEvents{
-		QueryPackagesFailure: func(provider addrs.Provider, err error) {
-			if err != nil && provider.IsDefault() && provider.Type == "test" {
-				// This is some additional context for the failure error
-				// we'll generate afterwards. Not the most ideal UX but
-				// good enough for this prototype implementation, to help
-				// hint about the special builtin provider we use here.
-				diags = diags.Append(tfdiags.Sourceless(
-					tfdiags.Warning,
-					"Probably-unintended reference to \"hashicorp/test\" provider",
-					"For the purposes of this experimental implementation of module test suites, you must use the built-in test provider terraform.io/builtin/test, which requires an explicit required_providers declaration.",
-				))
-			}
-		},
-	}
-	ctx = evts.OnContext(ctx)
-	locks, err = providerInst.EnsureProviderVersions(ctx, locks, reqs, providercache.InstallUpgrades)
-	if err != nil {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Error,
-			"Failed to install required providers",
-			fmt.Sprintf("Couldn't install necessary providers for test configuration %s: %s.", configDir, err),
-		))
-		return suiteDirs, diags
-	}
-	suiteDirs.ProviderLocks = locks
-	suiteDirs.ProviderCache = localCacheDir
-
-	return suiteDirs, diags
-}
-
-func (c *TestCommand) runTestSuite(ctx context.Context, suiteDirs testCommandSuiteDirs) (map[string]*moduletest.Component, *states.State) {
-	log.Printf("[TRACE] terraform test: Run test suite %q", suiteDirs.SuiteName)
-
-	ret := make(map[string]*moduletest.Component)
-
-	// To collect test results we'll use an instance of the special "test"
-	// provider, which records the intention to make a test assertion during
-	// planning and then hopefully updates that to an actual assertion result
-	// during apply, unless an apply error causes the graph walk to exit early.
-	// For this to work correctly, we must ensure we're using the same provider
-	// instance for both plan and apply.
-	testProvider := moduletest.NewProvider()
-
-	// synthError is a helper to return early with a synthetic failing
-	// component, for problems that prevent us from even discovering what an
-	// appropriate component and assertion name might be.
-	state := states.NewState()
-	synthError := func(name string, desc string, msg string, diags tfdiags.Diagnostics) (map[string]*moduletest.Component, *states.State) {
-		key := "(" + name + ")" // parens ensure this can't conflict with an actual component/assertion key
-		ret[key] = &moduletest.Component{
-			Assertions: map[string]*moduletest.Assertion{
-				key: {
-					Outcome:     moduletest.Error,
-					Description: desc,
-					Message:     msg,
-					Diagnostics: diags,
-				},
-			},
-		}
-		return ret, state
-	}
-
-	// NOTE: This function intentionally deviates from the usual pattern of
-	// gradually appending more diagnostics to the same diags, because
-	// here we're associating each set of diagnostics with the specific
-	// operation it belongs to.
-
-	providerFactories, diags := c.testSuiteProviders(suiteDirs, testProvider)
-	if diags.HasErrors() {
-		// It should be unusual to get in here, because testSuiteProviders
-		// should rely only on things guaranteed by prepareSuiteDir, but
-		// since we're doing external I/O here there is always the risk that
-		// the filesystem changes or fails between setting up and using the
-		// providers.
-		return synthError(
-			"init",
-			"terraform init",
-			"failed to resolve the required providers",
-			diags,
-		)
-	}
-
-	plan, diags := c.testSuitePlan(ctx, suiteDirs, providerFactories)
-	if diags.HasErrors() {
-		// It should be unusual to get in here, because testSuitePlan
-		// should rely only on things guaranteed by prepareSuiteDir, but
-		// since we're doing external I/O here there is always the risk that
-		// the filesystem changes or fails between setting up and using the
-		// providers.
-		return synthError(
-			"plan",
-			"terraform plan",
-			"failed to create a plan",
-			diags,
-		)
-	}
-
-	// Now we'll apply the plan. Once we try to apply, we might've created
-	// real remote objects, and so we must try to run destroy even if the
-	// apply returns errors, and we must return whatever state we end up
-	// with so the caller can generate additional loud errors if anything
-	// is left in it.
-
-	state, diags = c.testSuiteApply(ctx, plan, suiteDirs, providerFactories)
-	if diags.HasErrors() {
-		// We don't return here, unlike the others above, because we want to
-		// continue to the destroy below even if there are apply errors.
-		synthError(
-			"apply",
-			"terraform apply",
-			"failed to apply the created plan",
-			diags,
-		)
-	}
-
-	// By the time we get here, the test provider will have gathered up all
-	// of the planned assertions and the final results for any assertions that
-	// were not blocked by an error. This also resets the provider so that
-	// the destroy operation below won't get tripped up on stale results.
-	ret = testProvider.Reset()
-
-	state, diags = c.testSuiteDestroy(ctx, state, suiteDirs, providerFactories)
-	if diags.HasErrors() {
-		synthError(
-			"destroy",
-			"terraform destroy",
-			"failed to destroy objects created during test (NOTE: leftover remote objects may still exist)",
-			diags,
-		)
-	}
-
-	return ret, state
-}
-
-func (c *TestCommand) testSuiteProviders(suiteDirs testCommandSuiteDirs, testProvider *moduletest.Provider) (map[addrs.Provider]providers.Factory, tfdiags.Diagnostics) {
-	var diags tfdiags.Diagnostics
-	ret := make(map[addrs.Provider]providers.Factory)
-
-	// We can safely use the internal providers returned by Meta here because
-	// the built-in provider versions can never vary based on the configuration
-	// and thus we don't need to worry about potential version differences
-	// between main module and test suite modules.
-	for name, factory := range c.internalProviders() {
-		ret[addrs.NewBuiltInProvider(name)] = factory
-	}
-
-	// For the remaining non-builtin providers, we'll just take whatever we
-	// recorded earlier in the in-memory-only "lock file". All of these should
-	// typically still be available because we would've only just installed
-	// them, but this could fail if e.g. the filesystem has been somehow
-	// damaged in the meantime.
-	for provider, lock := range suiteDirs.ProviderLocks.AllProviders() {
-		version := lock.Version()
-		cached := suiteDirs.ProviderCache.ProviderVersion(provider, version)
-		if cached == nil {
-			diags = diags.Append(tfdiags.Sourceless(
-				tfdiags.Error,
-				"Required provider not found",
-				fmt.Sprintf("Although installation previously succeeded for %s v%s, it no longer seems to be present in the cache directory.", provider.ForDisplay(), version.String()),
-			))
-			continue // potentially collect up multiple errors
-		}
-
-		// NOTE: We don't consider the checksums for test suite dependencies,
-		// because we're creating a fresh "lock file" each time we run anyway
-		// and so they wouldn't actually guarantee anything useful.
-
-		ret[provider] = providerFactory(cached)
-	}
-
-	// We'll replace the test provider instance with the one our caller
-	// provided, so it'll be able to interrogate the test results directly.
-	ret[addrs.NewBuiltInProvider("test")] = func() (providers.Interface, error) {
-		return testProvider, nil
-	}
-
-	return ret, diags
-}
-
-type testSuiteRunContext struct {
-	Core *terraform.Context
-
-	PlanMode   plans.Mode
-	Config     *configs.Config
-	InputState *states.State
-	Changes    *plans.Changes
-}
-
-func (c *TestCommand) testSuiteContext(suiteDirs testCommandSuiteDirs, providerFactories map[addrs.Provider]providers.Factory, state *states.State, plan *plans.Plan, destroy bool) (*testSuiteRunContext, tfdiags.Diagnostics) {
-	var changes *plans.Changes
-	if plan != nil {
-		changes = plan.Changes
-	}
-
-	planMode := plans.NormalMode
-	if destroy {
-		planMode = plans.DestroyMode
-	}
-
-	tfCtx, diags := terraform.NewContext(&terraform.ContextOpts{
-		Providers: providerFactories,
-
-		// We just use the provisioners from the main Meta here, because
-		// unlike providers provisioner plugins are not automatically
-		// installable anyway, and so we'll need to hunt for them in the same
-		// legacy way that normal Terraform operations do.
-		Provisioners: c.provisionerFactories(),
-
-		Meta: &terraform.ContextMeta{
-			Env: "test_" + suiteDirs.SuiteName,
-		},
-	})
-	if diags.HasErrors() {
-		return nil, diags
-	}
-	return &testSuiteRunContext{
-		Core: tfCtx,
-
-		PlanMode:   planMode,
-		Config:     suiteDirs.Config,
-		InputState: state,
-		Changes:    changes,
-	}, diags
-}
-
-func (c *TestCommand) testSuitePlan(ctx context.Context, suiteDirs testCommandSuiteDirs, providerFactories map[addrs.Provider]providers.Factory) (*plans.Plan, tfdiags.Diagnostics) {
-	log.Printf("[TRACE] terraform test: create plan for suite %q", suiteDirs.SuiteName)
-	runCtx, diags := c.testSuiteContext(suiteDirs, providerFactories, nil, nil, false)
-	if diags.HasErrors() {
-		return nil, diags
-	}
-
-	// We'll also validate as part of planning, to ensure that the test
-	// configuration would pass "terraform validate". This is actually
-	// largely redundant with the runCtx.Core.Plan call below, but was
-	// included here originally because Plan did _originally_ assume that
-	// an earlier Validate had already passed, but now does its own
-	// validation work as (mostly) a superset of validate.
-	moreDiags := runCtx.Core.Validate(runCtx.Config)
-	diags = diags.Append(moreDiags)
-	if diags.HasErrors() {
-		return nil, diags
-	}
-
-	plan, moreDiags := runCtx.Core.Plan(
-		runCtx.Config, runCtx.InputState, &terraform.PlanOpts{Mode: runCtx.PlanMode},
-	)
-	diags = diags.Append(moreDiags)
-	return plan, diags
-}
-
-func (c *TestCommand) testSuiteApply(ctx context.Context, plan *plans.Plan, suiteDirs testCommandSuiteDirs, providerFactories map[addrs.Provider]providers.Factory) (*states.State, tfdiags.Diagnostics) {
-	log.Printf("[TRACE] terraform test: apply plan for suite %q", suiteDirs.SuiteName)
-	runCtx, diags := c.testSuiteContext(suiteDirs, providerFactories, nil, plan, false)
-	if diags.HasErrors() {
-		// To make things easier on the caller, we'll return a valid empty
-		// state even in this case.
-		return states.NewState(), diags
-	}
-
-	state, moreDiags := runCtx.Core.Apply(plan, runCtx.Config)
-	diags = diags.Append(moreDiags)
-	return state, diags
-}
-
-func (c *TestCommand) testSuiteDestroy(ctx context.Context, state *states.State, suiteDirs testCommandSuiteDirs, providerFactories map[addrs.Provider]providers.Factory) (*states.State, tfdiags.Diagnostics) {
-	log.Printf("[TRACE] terraform test: plan to destroy any existing objects for suite %q", suiteDirs.SuiteName)
-	runCtx, diags := c.testSuiteContext(suiteDirs, providerFactories, state, nil, true)
-	if diags.HasErrors() {
-		return state, diags
-	}
-
-	plan, moreDiags := runCtx.Core.Plan(
-		runCtx.Config, runCtx.InputState, &terraform.PlanOpts{Mode: runCtx.PlanMode},
-	)
-	diags = diags.Append(moreDiags)
-	if diags.HasErrors() {
-		return state, diags
-	}
-
-	log.Printf("[TRACE] terraform test: apply the plan to destroy any existing objects for suite %q", suiteDirs.SuiteName)
-	runCtx, moreDiags = c.testSuiteContext(suiteDirs, providerFactories, state, plan, true)
-	diags = diags.Append(moreDiags)
-	if diags.HasErrors() {
-		return state, diags
-	}
-
-	state, moreDiags = runCtx.Core.Apply(plan, runCtx.Config)
-	diags = diags.Append(moreDiags)
-	return state, diags
-}
-
-func (c *TestCommand) collectSuiteNames() ([]string, error) {
-	items, err := ioutil.ReadDir("tests")
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	ret := make([]string, 0, len(items))
-	for _, item := range items {
-		if !item.IsDir() {
-			continue
-		}
-		name := item.Name()
-		suitePath := filepath.Join("tests", name)
-		tfFiles, err := filepath.Glob(filepath.Join(suitePath, "*.tf"))
-		if err != nil {
-			// We'll just ignore it and treat it like a dir with no .tf files
-			tfFiles = nil
-		}
-		tfJSONFiles, err := filepath.Glob(filepath.Join(suitePath, "*.tf.json"))
-		if err != nil {
-			// We'll just ignore it and treat it like a dir with no .tf.json files
-			tfJSONFiles = nil
-		}
-		if (len(tfFiles) + len(tfJSONFiles)) == 0 {
-			// Not a test suite, then.
-			continue
-		}
-		ret = append(ret, name)
-	}
-
-	return ret, nil
-}
-
 func (c *TestCommand) Help() string {
 	helpText := `
-Usage: terraform test [options]
+Usage: terraform [global options] test [options]
 
-  This is an experimental command to help with automated integration
-  testing of shared modules. The usage and behavior of this command is
-  likely to change in breaking ways in subsequent releases, as we
-  are currently using this command primarily for research purposes.
+  Executes automated integration tests against the current Terraform 
+  configuration.
 
-  In its current experimental form, "test" will look under the current
-  working directory for a subdirectory called "tests", and then within
-  that directory search for one or more subdirectories that contain
-  ".tf" or ".tf.json" files. For any that it finds, it will perform
-  Terraform operations similar to the following sequence of commands
-  in each of those directories:
-      terraform validate
-      terraform apply
-      terraform destroy
+  Terraform will search for .tftest files within the current configuration and 
+  testing directories. Terraform will then execute the testing run blocks within
+  any testing files in order, and verify conditional checks and assertions 
+  against the created infrastructure. 
 
-  The test configurations should not declare any input variables and
-  should at least contain a call to the module being tested, which
-  will always be available at the path ../.. due to the expected
-  filesystem layout.
-
-  The tests are considered to be successful if all of the above steps
-  succeed.
-
-  Test configurations may optionally include uses of the special
-  built-in test provider terraform.io/builtin/test, which allows
-  writing explicit test assertions which must also all pass in order
-  for the test run to be considered successful.
-
-  This initial implementation is intended as a minimally-viable
-  product to use for further research and experimentation, and in
-  particular it currently lacks the following capabilities that we
-  expect to consider in later iterations, based on feedback:
-    - Testing of subsequent updates to existing infrastructure,
-      where currently it only supports initial creation and
-      then destruction.
-    - Testing top-level modules that are intended to be used for
-      "real" environments, which typically have hard-coded values
-      that don't permit creating a separate "copy" for testing.
-    - Some sort of support for unit test runs that don't interact
-      with remote systems at all, e.g. for use in checking pull
-      requests from untrusted contributors.
-
-  In the meantime, we'd like to hear feedback from module authors
-  who have tried writing some experimental tests for their modules
-  about what sorts of tests you were able to write, what sorts of
-  tests you weren't able to write, and any tests that you were
-  able to write but that were difficult to model in some way.
+  This command creates real infrastructure and will attempt to clean up the
+  testing infrastructure on completion. Monitor the output carefully to ensure
+  this cleanup process is successful.
 
 Options:
 
-  -compact-warnings  Use a more compact representation for warnings, if
-                     this command produces only warnings and no errors.
-
-  -junit-xml=FILE    In addition to the usual output, also write test
-                     results to the given file path in JUnit XML format.
-                     This format is commonly supported by CI systems, and
-                     they typically expect to be given a filename to search
-                     for in the test workspace after the test run finishes.
-
-  -no-color          Don't include virtual terminal formatting sequences in
-                     the output.
+  TODO: implement optional arguments.
 `
 	return strings.TrimSpace(helpText)
 }
 
 func (c *TestCommand) Synopsis() string {
-	return "Experimental support for module integration testing"
+	return "Execute integration tests for Terraform modules"
 }
 
-type testCommandSuiteDirs struct {
-	SuiteName string
+func (c *TestCommand) Run(rawArgs []string) int {
+	var diags tfdiags.Diagnostics
 
-	ConfigDir    string
-	ModulesDir   string
-	ProvidersDir string
+	common, _ := arguments.ParseView(rawArgs)
+	c.View.Configure(common)
 
-	Config        *configs.Config
-	ProviderCache *providercache.Dir
-	ProviderLocks *depsfile.Locks
+	view := views.NewTest(arguments.ViewHuman, c.View)
+
+	config, configDiags := c.loadConfigWithTests(".", "tests")
+	diags = diags.Append(configDiags)
+	if configDiags.HasErrors() {
+		view.Diagnostics(nil, nil, diags)
+		return 1
+	}
+
+	suite := moduletest.Suite{
+		Files: func() map[string]*moduletest.File {
+			files := make(map[string]*moduletest.File)
+			for name, file := range config.Module.Tests {
+				var runs []*moduletest.Run
+				for _, run := range file.Runs {
+					runs = append(runs, &moduletest.Run{
+						Config: run,
+						Name:   run.Name,
+					})
+				}
+				files[name] = &moduletest.File{
+					Config: file,
+					Name:   name,
+					Runs:   runs,
+				}
+			}
+			return files
+		}(),
+	}
+
+	runningCtx, done := context.WithCancel(context.Background())
+	stopCtx, stop := context.WithCancel(runningCtx)
+	cancelCtx, cancel := context.WithCancel(context.Background())
+
+	runner := &TestRunner{
+		command: c,
+
+		Suite:  &suite,
+		Config: config,
+		View:   view,
+
+		CancelledCtx: cancelCtx,
+		StoppedCtx:   stopCtx,
+
+		// Just to be explicit, we'll set the following fields even though they
+		// default to these values.
+		Cancelled: false,
+		Stopped:   false,
+	}
+
+	view.Abstract(&suite)
+
+	go func() {
+		defer logging.PanicHandler()
+		defer done() // We completed successfully.
+		defer stop()
+		defer cancel()
+
+		runner.Start()
+	}()
+
+	// Wait for the operation to complete, or for an interrupt to occur.
+	select {
+	case <-c.ShutdownCh:
+		// Nice request to be cancelled.
+
+		view.Interrupted()
+		runner.Stopped = true
+		stop()
+
+		select {
+		case <-c.ShutdownCh:
+			// The user pressed it again, now we have to get it to stop as
+			// fast as possible.
+
+			view.FatalInterrupt()
+			runner.Cancelled = true
+			cancel()
+
+			// TODO(liamcervante): Should we add a timer here? That would mean
+			//   after 5 seconds we just give up and don't even print out the
+			//   lists of resources left behind?
+			<-runningCtx.Done() // Nothing left to do now but wait.
+
+		case <-runningCtx.Done():
+			// The application finished nicely after the request was stopped.
+		}
+	case <-runningCtx.Done():
+		// tests finished normally with no interrupts.
+	}
+
+	if runner.Cancelled {
+		// Don't print out the conclusion if the test was cancelled.
+		return 1
+	}
+
+	view.Conclusion(&suite)
+
+	if suite.Status != moduletest.Pass {
+		return 1
+	}
+	return 0
+}
+
+// test runner
+
+type TestRunner struct {
+	command *TestCommand
+
+	Suite  *moduletest.Suite
+	Config *configs.Config
+
+	View views.Test
+
+	// Stopped and Cancelled track whether the user requested the testing
+	// process to be interrupted. Stopped is a nice graceful exit, we'll still
+	// tidy up any state that was created and mark the tests with relevant
+	// `skipped` status updates. Cancelled is a hard stop right now exit, we
+	// won't attempt to clean up any state left hanging, and tests will just
+	// be left showing `pending` as the status. We will still print out the
+	// destroy summary diagnostics that tell the user what state has been left
+	// behind and needs manual clean up.
+	Stopped   bool
+	Cancelled bool
+
+	// StoppedCtx and CancelledCtx allow in progress Terraform operations to
+	// respond to external calls from the test command.
+	StoppedCtx   context.Context
+	CancelledCtx context.Context
+}
+
+func (runner *TestRunner) Start() {
+	var files []string
+	for name := range runner.Suite.Files {
+		files = append(files, name)
+	}
+	sort.Strings(files) // execute the files in alphabetical order
+
+	runner.Suite.Status = moduletest.Pass
+	for _, name := range files {
+		if runner.Cancelled {
+			return
+		}
+
+		file := runner.Suite.Files[name]
+		runner.ExecuteTestFile(file)
+		runner.Suite.Status = runner.Suite.Status.Merge(file.Status)
+	}
+}
+
+func (runner *TestRunner) ExecuteTestFile(file *moduletest.File) {
+	mgr := new(TestStateManager)
+	mgr.runner = runner
+	mgr.State = states.NewState()
+	defer mgr.cleanupStates(file)
+
+	file.Status = file.Status.Merge(moduletest.Pass)
+	for _, run := range file.Runs {
+		if runner.Cancelled {
+			// This means a hard stop has been requested, in this case we don't
+			// even stop to mark future tests as having been skipped. They'll
+			// just show up as pending in the printed summary.
+			return
+		}
+
+		if runner.Stopped {
+			// Then the test was requested to be stopped, so we just mark each
+			// following test as skipped and move on.
+			run.Status = moduletest.Skip
+			continue
+		}
+
+		if file.Status == moduletest.Error {
+			// If the overall test file has errored, we don't keep trying to
+			// execute tests. Instead, we mark all remaining run blocks as
+			// skipped.
+			run.Status = moduletest.Skip
+			continue
+		}
+
+		if run.Config.ConfigUnderTest != nil {
+			// Then we want to execute a different module under a kind of
+			// sandbox.
+			state := runner.ExecuteTestRun(run, file, states.NewState(), run.Config.ConfigUnderTest)
+			mgr.States = append(mgr.States, &TestModuleState{
+				State: state,
+				Run:   run,
+			})
+		} else {
+			mgr.State = runner.ExecuteTestRun(run, file, mgr.State, runner.Config)
+		}
+		file.Status = file.Status.Merge(run.Status)
+	}
+
+	runner.View.File(file)
+	for _, run := range file.Runs {
+		runner.View.Run(run, file)
+	}
+}
+
+func (runner *TestRunner) ExecuteTestRun(run *moduletest.Run, file *moduletest.File, state *states.State, config *configs.Config) *states.State {
+	if runner.Cancelled {
+		// Don't do anything, just give up and return immediately.
+		// The surrounding functions should stop this even being called, but in
+		// case of race conditions or something we can still verify this.
+		return state
+	}
+
+	if runner.Stopped {
+		// Basically the same as above, except we'll be a bit nicer.
+		run.Status = moduletest.Skip
+		return state
+	}
+
+	targets, diags := run.GetTargets()
+	run.Diagnostics = run.Diagnostics.Append(diags)
+
+	replaces, diags := run.GetReplaces()
+	run.Diagnostics = run.Diagnostics.Append(diags)
+
+	references, diags := run.GetReferences()
+	run.Diagnostics = run.Diagnostics.Append(diags)
+
+	if run.Diagnostics.HasErrors() {
+		run.Status = moduletest.Error
+		return state
+	}
+
+	ctx, plan, state, diags := runner.execute(run, file, config, state, &terraform.PlanOpts{
+		Mode: func() plans.Mode {
+			switch run.Config.Options.Mode {
+			case configs.RefreshOnlyTestMode:
+				return plans.RefreshOnlyMode
+			default:
+				return plans.NormalMode
+			}
+		}(),
+		Targets:            targets,
+		ForceReplace:       replaces,
+		SkipRefresh:        !run.Config.Options.Refresh,
+		ExternalReferences: references,
+	}, run.Config.Command)
+	run.Diagnostics = run.Diagnostics.Append(diags)
+
+	if runner.Cancelled {
+		// Print out the diagnostics from the run now, since it was cancelled
+		// the normal set of diagnostics will not be printed otherwise.
+		runner.View.Diagnostics(run, file, run.Diagnostics)
+		run.Status = moduletest.Error
+		return state
+	}
+
+	if diags.HasErrors() {
+		run.Status = moduletest.Error
+		return state
+	}
+
+	if runner.Stopped {
+		run.Status = moduletest.Skip
+		return state
+	}
+
+	variables, diags := buildInputVariablesForAssertions(run, file, config)
+	run.Diagnostics = run.Diagnostics.Append(diags)
+	if diags.HasErrors() {
+		run.Status = moduletest.Error
+		return state
+	}
+
+	if run.Config.Command == configs.ApplyTestCommand {
+		ctx.TestContext(config, state, plan, variables).EvaluateAgainstState(run)
+		return state
+	}
+
+	ctx.TestContext(config, plan.PlannedState, plan, variables).EvaluateAgainstPlan(run)
+	return state
+}
+
+// execute executes Terraform plan and apply operations for the given arguments.
+//
+// The command argument decides whether it executes only a plan or also applies
+// the plan it creates during the planning.
+func (runner *TestRunner) execute(run *moduletest.Run, file *moduletest.File, config *configs.Config, state *states.State, opts *terraform.PlanOpts, command configs.TestCommand) (*terraform.Context, *plans.Plan, *states.State, tfdiags.Diagnostics) {
+	if opts.Mode == plans.DestroyMode && state.Empty() {
+		// Nothing to do!
+		return nil, nil, state, nil
+	}
+
+	identifier := file.Name
+	if run != nil {
+		identifier = fmt.Sprintf("%s/%s", identifier, run.Name)
+	}
+
+	// First, transform the config for the given test run and test file.
+
+	var diags tfdiags.Diagnostics
+	if run == nil {
+		reset, cfgDiags := config.TransformForTest(nil, file.Config)
+		defer reset()
+		diags = diags.Append(cfgDiags)
+	} else {
+		reset, cfgDiags := config.TransformForTest(run.Config, file.Config)
+		defer reset()
+		diags = diags.Append(cfgDiags)
+	}
+	if diags.HasErrors() {
+		return nil, nil, state, diags
+	}
+
+	// Second, gather any variables and give them to the plan options.
+
+	variables, variableDiags := buildInputVariablesForTest(run, file, config)
+	diags = diags.Append(variableDiags)
+	if variableDiags.HasErrors() {
+		return nil, nil, state, diags
+	}
+	opts.SetVariables = variables
+
+	// Third, execute planning stage.
+
+	tfCtxOpts, err := runner.command.contextOpts()
+	diags = diags.Append(err)
+	if err != nil {
+		return nil, nil, state, diags
+	}
+
+	tfCtx, ctxDiags := terraform.NewContext(tfCtxOpts)
+	diags = diags.Append(ctxDiags)
+	if ctxDiags.HasErrors() {
+		return nil, nil, state, diags
+	}
+
+	runningCtx, done := context.WithCancel(context.Background())
+
+	var plan *plans.Plan
+	var planDiags tfdiags.Diagnostics
+	go func() {
+		defer done()
+		plan, planDiags = tfCtx.Plan(config, state, opts)
+	}()
+	waitDiags, cancelled := runner.wait(tfCtx, runningCtx, opts, identifier)
+	planDiags = planDiags.Append(waitDiags)
+
+	diags = diags.Append(planDiags)
+	if planDiags.HasErrors() || command == configs.PlanTestCommand {
+		// Either the plan errored, or we only wanted to see the plan. Either
+		// way, just return what we have: The plan and diagnostics from making
+		// it and the unchanged state.
+		return tfCtx, plan, state, diags
+	}
+
+	if cancelled {
+		// If the execution was cancelled during the plan, we'll exit here to
+		// stop the plan being applied and using more time.
+		return tfCtx, plan, state, diags
+	}
+
+	// Fourth, execute apply stage.
+	tfCtx, ctxDiags = terraform.NewContext(tfCtxOpts)
+	diags = diags.Append(ctxDiags)
+	if ctxDiags.HasErrors() {
+		return nil, nil, state, diags
+	}
+
+	runningCtx, done = context.WithCancel(context.Background())
+
+	var updated *states.State
+	var applyDiags tfdiags.Diagnostics
+
+	go func() {
+		defer done()
+		updated, applyDiags = tfCtx.Apply(plan, config)
+	}()
+	waitDiags, _ = runner.wait(tfCtx, runningCtx, opts, identifier)
+	applyDiags = applyDiags.Append(waitDiags)
+
+	diags = diags.Append(applyDiags)
+	return tfCtx, plan, updated, diags
+}
+
+func (runner *TestRunner) wait(ctx *terraform.Context, runningCtx context.Context, opts *terraform.PlanOpts, identifier string) (diags tfdiags.Diagnostics, cancelled bool) {
+	select {
+	case <-runner.StoppedCtx.Done():
+
+		if opts.Mode != plans.DestroyMode {
+			// It takes more impetus from the user to cancel the cleanup
+			// operations, so we only do this during the actual tests.
+			cancelled = true
+			go ctx.Stop()
+		}
+
+		select {
+		case <-runner.CancelledCtx.Done():
+
+			// If the user still really wants to cancel, then we'll oblige
+			// even during the destroy mode at this point.
+			if opts.Mode == plans.DestroyMode {
+				cancelled = true
+				go ctx.Stop()
+			}
+
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Terraform Test Interrupted",
+				fmt.Sprintf("Terraform test was interrupted while executing %s. This means resources that were created during the test may have been left active, please monitor the rest of the output closely as any dangling resources will be listed.", identifier)))
+
+			// It is actually quite disastrous if we exist early at this
+			// point as it means we'll have created resources that we
+			// haven't tracked at all. So for now, we won't ever actually
+			// forcibly terminate the test. When cancelled, we make the
+			// clean up faster by not performing it but we should still
+			// always manage it give an accurate list of resources left
+			// alive.
+			// TODO(liamcervante): Consider adding a timer here, so that we
+			//   exit early even if that means some resources are just lost
+			//   forever.
+			<-runningCtx.Done() // Just wait for things to finish now.
+
+		case <-runningCtx.Done():
+			// The operation exited nicely when asked!
+		}
+	case <-runner.CancelledCtx.Done():
+		// This shouldn't really happen, as we'd expect to see the StoppedCtx
+		// being triggered first. But, just in case.
+		cancelled = true
+		go ctx.Stop()
+
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Terraform Test Interrupted",
+			fmt.Sprintf("Terraform test was interrupted while executing %s. This means resources that were created during the test may have been left active, please monitor the rest of the output closely as any dangling resources will be listed.", identifier)))
+
+		// It is actually quite disastrous if we exist early at this
+		// point as it means we'll have created resources that we
+		// haven't tracked at all. So for now, we won't ever actually
+		// forcibly terminate the test. When cancelled, we make the
+		// clean up faster by not performing it but we should still
+		// always manage it give an accurate list of resources left
+		// alive.
+		// TODO(liamcervante): Consider adding a timer here, so that we
+		//   exit early even if that means some resources are just lost
+		//   forever.
+		<-runningCtx.Done() // Just wait for things to finish now.
+
+	case <-runningCtx.Done():
+		// The operation exited normally.
+	}
+
+	return diags, cancelled
+}
+
+// state management
+
+// TestStateManager is a helper struct to maintain the various state objects
+// that a test file has to keep track of.
+type TestStateManager struct {
+	runner *TestRunner
+
+	// State is the main state of the module under test during a single test
+	// file execution. This state will be updated by every run block without
+	// a modifier module block within the test file. At the end of the test
+	// file's execution everything in this state should be executed.
+	State *states.State
+
+	// States contains the states of every run block within a test file that
+	// executed using an alternative module. Any resources created by these
+	// run blocks also need to be tidied up, but only after the main state file
+	// has been handled.
+	States []*TestModuleState
+}
+
+// TestModuleState holds the config and the state for a given run block that
+// executed with a custom module.
+type TestModuleState struct {
+	// State is the state after the module executed.
+	State *states.State
+
+	// Run is the config for the given run block, that contains the config
+	// under test and the variable values.
+	Run *moduletest.Run
+}
+
+func (manager *TestStateManager) cleanupStates(file *moduletest.File) {
+	if manager.runner.Cancelled {
+
+		// We are still going to print out the resources that we have left
+		// even though the user asked for an immediate exit.
+
+		var diags tfdiags.Diagnostics
+		diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "Test cleanup skipped due to immediate exit", "Terraform could not clean up the state left behind due to immediate interrupt."))
+		manager.runner.View.DestroySummary(diags, nil, file, manager.State)
+
+		for _, module := range manager.States {
+			manager.runner.View.DestroySummary(diags, module.Run, file, module.State)
+		}
+
+		return
+	}
+
+	// First, we'll clean up the main state.
+	_, _, state, diags := manager.runner.execute(nil, file, manager.runner.Config, manager.State, &terraform.PlanOpts{
+		Mode: plans.DestroyMode,
+	}, configs.ApplyTestCommand)
+	manager.runner.View.DestroySummary(diags, nil, file, state)
+
+	// Then we'll clean up the additional states for custom modules in reverse
+	// order.
+	for ix := len(manager.States); ix > 0; ix-- {
+		module := manager.States[ix-1]
+
+		if manager.runner.Cancelled {
+			// In case the cancellation came while a previous state was being
+			// destroyed.
+			manager.runner.View.DestroySummary(diags, module.Run, file, module.State)
+			continue
+		}
+
+		_, _, state, diags := manager.runner.execute(module.Run, file, module.Run.Config.ConfigUnderTest, module.State, &terraform.PlanOpts{
+			Mode: plans.DestroyMode,
+		}, configs.ApplyTestCommand)
+		manager.runner.View.DestroySummary(diags, module.Run, file, state)
+	}
+}
+
+// helper functions
+
+// buildInputVariablesForTest creates a terraform.InputValues mapping for
+// variable values that are relevant to the config being tested.
+//
+// Crucially, it differs from buildInputVariablesForAssertions in that it only
+// includes variables that are reference by the config and not everything that
+// is defined within the test run block and test file.
+func buildInputVariablesForTest(run *moduletest.Run, file *moduletest.File, config *configs.Config) (terraform.InputValues, tfdiags.Diagnostics) {
+	variables := make(map[string]hcl.Expression)
+	for name := range config.Module.Variables {
+		if run != nil {
+			if expr, exists := run.Config.Variables[name]; exists {
+				// Local variables take precedence.
+				variables[name] = expr
+				continue
+			}
+		}
+
+		if file != nil {
+			if expr, exists := file.Config.Variables[name]; exists {
+				// If it's not set locally, it maybe set globally.
+				variables[name] = expr
+				continue
+			}
+		}
+
+		// If it's not set at all that might be okay if the variable is optional
+		// so we'll just not add anything to the map.
+	}
+
+	unparsed := make(map[string]backend.UnparsedVariableValue)
+	for key, value := range variables {
+		unparsed[key] = unparsedVariableValueExpression{
+			expr:       value,
+			sourceType: terraform.ValueFromConfig,
+		}
+	}
+	return backend.ParseVariableValues(unparsed, config.Module.Variables)
+}
+
+// buildInputVariablesForAssertions creates a terraform.InputValues mapping that
+// contains all the variables defined for a given run and file, alongside any
+// unset variables that have defaults within the provided config.
+//
+// Crucially, it differs from buildInputVariablesForTest in that the returned
+// input values include all variables available even if they are not defined
+// within the config.
+//
+// This does mean the returned diags might contain warnings about variables not
+// defined within the config. We might want to remove these warnings in the
+// future, since it is actually okay for test files to have variables defined
+// outside the configuration.
+func buildInputVariablesForAssertions(run *moduletest.Run, file *moduletest.File, config *configs.Config) (terraform.InputValues, tfdiags.Diagnostics) {
+	merged := make(map[string]hcl.Expression)
+
+	if run != nil {
+		for name, expr := range run.Config.Variables {
+			merged[name] = expr
+		}
+	}
+
+	if file != nil {
+		for name, expr := range file.Config.Variables {
+			if _, exists := merged[name]; exists {
+				// Then this variable was defined at the run level and we want
+				// that value to take precedence.
+				continue
+			}
+			merged[name] = expr
+		}
+	}
+
+	unparsed := make(map[string]backend.UnparsedVariableValue)
+	for key, value := range merged {
+		unparsed[key] = unparsedVariableValueExpression{
+			expr:       value,
+			sourceType: terraform.ValueFromConfig,
+		}
+	}
+	return backend.ParseVariableValues(unparsed, config.Module.Variables)
 }

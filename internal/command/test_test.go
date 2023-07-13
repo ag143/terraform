@@ -1,163 +1,344 @@
 package command
 
 import (
-	"bytes"
-	"io/ioutil"
+	"path"
 	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/mitchellh/cli"
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/internal/addrs"
+	testing_command "github.com/hashicorp/terraform/internal/command/testing"
 	"github.com/hashicorp/terraform/internal/command/views"
+	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/terminal"
 )
 
-// These are the main tests for the "terraform test" command.
 func TestTest(t *testing.T) {
-	t.Run("passes", func(t *testing.T) {
-		td := t.TempDir()
-		testCopyDir(t, testFixturePath("test-passes"), td)
-		defer testChdir(t, td)()
+	tcs := map[string]struct {
+		args     []string
+		expected string
+		code     int
+		skip     bool
+	}{
+		"simple_pass": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+		},
+		"simple_pass_nested": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+		},
+		"pass_with_locals": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+		},
+		"pass_with_outputs": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+		},
+		"pass_with_variables": {
+			expected: "2 passed, 0 failed.",
+			code:     0,
+		},
+		"plan_then_apply": {
+			expected: "2 passed, 0 failed.",
+			code:     0,
+		},
+		"expect_failures_checks": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+			// TODO(liamcervante): Enable this when support for expect_failures
+			//   has been added.
+			skip: true,
+		},
+		"expect_failures_inputs": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+			// TODO(liamcervante): Enable this when support for expect_failures
+			//   has been added.
+			skip: true,
+		},
+		"expect_failures_outputs": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+			// TODO(liamcervante): Enable this when support for expect_failures
+			//   has been added.
+			skip: true,
+		},
+		"expect_failures_resources": {
+			expected: "1 passed, 0 failed.",
+			code:     0,
+			// TODO(liamcervante): Enable this when support for expect_failures
+			//   has been added.
+			skip: true,
+		},
+		"simple_fail": {
+			expected: "0 passed, 1 failed.",
+			code:     1,
+		},
+		"custom_condition_checks": {
+			expected: "0 passed, 1 failed.",
+			code:     1,
+			// TODO(liamcervante): Enable this, at the moment checks aren't
+			//   causing the tests to fail when they should. Also, it's not
+			//   skipping warnings during the plan when it should.
+			skip: true,
+		},
+		"custom_condition_inputs": {
+			expected: "0 passed, 1 failed.",
+			code:     1,
+		},
+		"custom_condition_outputs": {
+			expected: "0 passed, 1 failed.",
+			code:     1,
+		},
+		"custom_condition_resources": {
+			expected: "0 passed, 1 failed.",
+			code:     1,
+		},
+	}
+	for name, tc := range tcs {
+		t.Run(name, func(t *testing.T) {
+			if tc.skip {
+				t.Skip()
+			}
 
-		streams, close := terminal.StreamsForTesting(t)
-		cmd := &TestCommand{
-			Meta: Meta{
-				Streams: streams,
-				View:    views.NewView(streams),
-			},
-		}
-		exitStatus := cmd.Run([]string{"-junit-xml=junit.xml", "-no-color"})
-		outp := close(t)
-		if got, want := exitStatus, 0; got != want {
-			t.Fatalf("wrong exit status %d; want %d\nstderr:\n%s", got, want, outp.Stderr())
-		}
+			td := t.TempDir()
+			testCopyDir(t, testFixturePath(path.Join("test", name)), td)
+			defer testChdir(t, td)()
 
-		gotStdout := strings.TrimSpace(outp.Stdout())
-		wantStdout := strings.TrimSpace(`
-Warning: The "terraform test" command is experimental
+			provider := testing_command.NewProvider(nil)
+			view, done := testView(t)
 
-We'd like to invite adventurous module authors to write integration tests for
-their modules using this command, but all of the behaviors of this command
-are currently experimental and may change based on feedback.
+			c := &TestCommand{
+				Meta: Meta{
+					testingOverrides: metaOverridesForProvider(provider.Provider),
+					View:             view,
+				},
+			}
 
-For more information on the testing experiment, including ongoing research
-goals and avenues for feedback, see:
-    https://www.terraform.io/docs/language/modules/testing-experiment.html
-`)
-		if diff := cmp.Diff(wantStdout, gotStdout); diff != "" {
-			t.Errorf("wrong stdout\n%s", diff)
-		}
+			code := c.Run(tc.args)
+			output := done(t)
 
-		gotStderr := strings.TrimSpace(outp.Stderr())
-		wantStderr := strings.TrimSpace(`
-Success! All of the test assertions passed.
-`)
-		if diff := cmp.Diff(wantStderr, gotStderr); diff != "" {
-			t.Errorf("wrong stderr\n%s", diff)
-		}
+			if code != tc.code {
+				t.Errorf("expected status code %d but got %d", tc.code, code)
+			}
 
-		gotXMLSrc, err := ioutil.ReadFile("junit.xml")
-		if err != nil {
-			t.Fatal(err)
-		}
-		gotXML := string(bytes.TrimSpace(gotXMLSrc))
-		wantXML := strings.TrimSpace(`
-<testsuites>
-  <errors>0</errors>
-  <failures>0</failures>
-  <tests>1</tests>
-  <testsuite>
-    <name>hello</name>
-    <tests>1</tests>
-    <skipped>0</skipped>
-    <errors>0</errors>
-    <failures>0</failures>
-    <testcase>
-      <name>output</name>
-      <classname>foo</classname>
-    </testcase>
-  </testsuite>
-</testsuites>
-`)
-		if diff := cmp.Diff(wantXML, gotXML); diff != "" {
-			t.Errorf("wrong JUnit XML\n%s", diff)
-		}
+			if !strings.Contains(output.Stdout(), tc.expected) {
+				t.Errorf("output didn't contain expected string:\n\n%s", output.All())
+			}
+
+			if provider.ResourceCount() > 0 {
+				t.Errorf("should have deleted all resources on completion but left %v", provider.ResourceString())
+			}
+		})
+	}
+}
+
+func TestTest_Interrupt(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "with_interrupt")), td)
+	defer testChdir(t, td)()
+
+	provider := testing_command.NewProvider(nil)
+	view, done := testView(t)
+
+	interrupt := make(chan struct{})
+	provider.Interrupt = interrupt
+
+	c := &TestCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider.Provider),
+			View:             view,
+			ShutdownCh:       interrupt,
+		},
+	}
+
+	c.Run(nil)
+	output := done(t).All()
+
+	if !strings.Contains(output, "Interrupt received") {
+		t.Errorf("output didn't produce the right output:\n\n%s", output)
+	}
+
+	if provider.ResourceCount() > 0 {
+		// we asked for a nice stop in this one, so it should still have tidied everything up.
+		t.Errorf("should have deleted all resources on completion but left %v", provider.ResourceString())
+	}
+}
+
+func TestTest_DoubleInterrupt(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "with_double_interrupt")), td)
+	defer testChdir(t, td)()
+
+	provider := testing_command.NewProvider(nil)
+	view, done := testView(t)
+
+	interrupt := make(chan struct{})
+	provider.Interrupt = interrupt
+
+	c := &TestCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider.Provider),
+			View:             view,
+			ShutdownCh:       interrupt,
+		},
+	}
+
+	c.Run(nil)
+	output := done(t).All()
+
+	if !strings.Contains(output, "Two interrupts received") {
+		t.Errorf("output didn't produce the right output:\n\n%s", output)
+	}
+
+	// This time the test command shouldn't have cleaned up the resource because
+	// of the hard interrupt.
+	if provider.ResourceCount() != 3 {
+		// we asked for a nice stop in this one, so it should still have tidied everything up.
+		t.Errorf("should not have deleted all resources on completion but left %v", provider.ResourceString())
+	}
+}
+
+func TestTest_ProviderAlias(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "with_provider_alias")), td)
+	defer testChdir(t, td)()
+
+	provider := testing_command.NewProvider(nil)
+
+	providerSource, close := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
 	})
-	t.Run("fails", func(t *testing.T) {
-		td := t.TempDir()
-		testCopyDir(t, testFixturePath("test-fails"), td)
-		defer testChdir(t, td)()
+	defer close()
 
-		streams, close := terminal.StreamsForTesting(t)
-		cmd := &TestCommand{
-			Meta: Meta{
-				Streams: streams,
-				View:    views.NewView(streams),
-			},
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: metaOverridesForProvider(provider.Provider),
+		Ui:               ui,
+		View:             view,
+		Streams:          streams,
+		ProviderSource:   providerSource,
+	}
+
+	init := &InitCommand{
+		Meta: meta,
+	}
+
+	if code := init.Run(nil); code != 0 {
+		t.Fatalf("expected status code 0 but got %d: %s", code, ui.ErrorWriter)
+	}
+
+	command := &TestCommand{
+		Meta: meta,
+	}
+
+	code := command.Run(nil)
+	output := done(t)
+
+	printedOutput := false
+
+	if code != 0 {
+		printedOutput = true
+		t.Errorf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	if provider.ResourceCount() > 0 {
+		if !printedOutput {
+			t.Errorf("should have deleted all resources on completion but left %s\n\n%s", provider.ResourceString(), output.All())
+		} else {
+			t.Errorf("should have deleted all resources on completion but left %s", provider.ResourceString())
 		}
-		exitStatus := cmd.Run([]string{"-junit-xml=junit.xml", "-no-color"})
-		outp := close(t)
-		if got, want := exitStatus, 1; got != want {
-			t.Fatalf("wrong exit status %d; want %d\nstderr:\n%s", got, want, outp.Stderr())
-		}
+	}
+}
 
-		gotStdout := strings.TrimSpace(outp.Stdout())
-		wantStdout := strings.TrimSpace(`
-Warning: The "terraform test" command is experimental
+func TestTest_ModuleDependencies(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "with_setup_module")), td)
+	defer testChdir(t, td)()
 
-We'd like to invite adventurous module authors to write integration tests for
-their modules using this command, but all of the behaviors of this command
-are currently experimental and may change based on feedback.
+	// Our two providers will share a common set of values to make things
+	// easier.
+	store := &testing_command.ResourceStore{
+		Data: make(map[string]cty.Value),
+	}
 
-For more information on the testing experiment, including ongoing research
-goals and avenues for feedback, see:
-    https://www.terraform.io/docs/language/modules/testing-experiment.html
-`)
-		if diff := cmp.Diff(wantStdout, gotStdout); diff != "" {
-			t.Errorf("wrong stdout\n%s", diff)
-		}
+	// We set it up so the module provider will update the data sources
+	// available to the core mock provider.
+	test := testing_command.NewProvider(store)
+	setup := testing_command.NewProvider(store)
 
-		gotStderr := strings.TrimSpace(outp.Stderr())
-		wantStderr := strings.TrimSpace(`
-─── Failed: hello.foo.output (output "foo" value) ───────────────────────────
-wrong value
-    got:  "foo value boop"
-    want: "foo not boop"
+	test.SetDataPrefix("data")
+	test.SetResourcePrefix("resource")
 
-─────────────────────────────────────────────────────────────────────────────
-`)
-		if diff := cmp.Diff(wantStderr, gotStderr); diff != "" {
-			t.Errorf("wrong stderr\n%s", diff)
-		}
+	// Let's make the setup provider write into the data for test provider.
+	setup.SetResourcePrefix("data")
 
-		gotXMLSrc, err := ioutil.ReadFile("junit.xml")
-		if err != nil {
-			t.Fatal(err)
-		}
-		gotXML := string(bytes.TrimSpace(gotXMLSrc))
-		wantXML := strings.TrimSpace(`
-<testsuites>
-  <errors>0</errors>
-  <failures>1</failures>
-  <tests>1</tests>
-  <testsuite>
-    <name>hello</name>
-    <tests>1</tests>
-    <skipped>0</skipped>
-    <errors>0</errors>
-    <failures>1</failures>
-    <testcase>
-      <name>output</name>
-      <classname>foo</classname>
-      <failure>
-        <message>wrong value&#xA;    got:  &#34;foo value boop&#34;&#xA;    want: &#34;foo not boop&#34;&#xA;</message>
-      </failure>
-    </testcase>
-  </testsuite>
-</testsuites>
-`)
-		if diff := cmp.Diff(wantXML, gotXML); diff != "" {
-			t.Errorf("wrong JUnit XML\n%s", diff)
-		}
+	providerSource, close := newMockProviderSource(t, map[string][]string{
+		"test":  {"1.0.0"},
+		"setup": {"1.0.0"},
 	})
+	defer close()
 
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"):  providers.FactoryFixed(test.Provider),
+				addrs.NewDefaultProvider("setup"): providers.FactoryFixed(setup.Provider),
+			},
+		},
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{
+		Meta: meta,
+	}
+
+	if code := init.Run(nil); code != 0 {
+		t.Fatalf("expected status code 0 but got %d: %s", code, ui.ErrorWriter)
+	}
+
+	command := &TestCommand{
+		Meta: meta,
+	}
+
+	code := command.Run(nil)
+	output := done(t)
+
+	printedOutput := false
+
+	if code != 0 {
+		printedOutput = true
+		t.Errorf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	if test.ResourceCount() > 0 {
+		if !printedOutput {
+			printedOutput = true
+			t.Errorf("should have deleted all resources on completion but left %s\n\n%s", test.ResourceString(), output.All())
+		} else {
+			t.Errorf("should have deleted all resources on completion but left %s", test.ResourceString())
+		}
+	}
+
+	if setup.ResourceCount() > 0 {
+		if !printedOutput {
+			t.Errorf("should have deleted all resources on completion but left %s\n\n%s", setup.ResourceString(), output.All())
+		} else {
+			t.Errorf("should have deleted all resources on completion but left %s", setup.ResourceString())
+		}
+	}
 }

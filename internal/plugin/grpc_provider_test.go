@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package plugin
 
 import (
@@ -36,6 +39,15 @@ func checkDiags(t *testing.T, d tfdiags.Diagnostics) {
 	t.Helper()
 	if d.HasErrors() {
 		t.Fatal(d.Err())
+	}
+}
+
+// checkDiagsHasError ensures error diagnostics are present or fails the test.
+func checkDiagsHasError(t *testing.T, d tfdiags.Diagnostics) {
+	t.Helper()
+
+	if !d.HasErrors() {
+		t.Fatal("expected error diagnostics")
 	}
 }
 
@@ -90,6 +102,58 @@ func TestGRPCProvider_GetSchema(t *testing.T) {
 
 	resp := p.GetProviderSchema()
 	checkDiags(t, resp.Diagnostics)
+}
+
+// Ensure that gRPC errors are returned early.
+// Reference: https://github.com/hashicorp/terraform/issues/31047
+func TestGRPCProvider_GetSchema_GRPCError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	client := mockproto.NewMockProviderClient(ctrl)
+
+	client.EXPECT().GetSchema(
+		gomock.Any(),
+		gomock.Any(),
+		gomock.Any(),
+	).Return(&proto.GetProviderSchema_Response{}, fmt.Errorf("test error"))
+
+	p := &GRPCProvider{
+		client: client,
+	}
+
+	resp := p.GetProviderSchema()
+
+	checkDiagsHasError(t, resp.Diagnostics)
+}
+
+// Ensure that provider error diagnostics are returned early.
+// Reference: https://github.com/hashicorp/terraform/issues/31047
+func TestGRPCProvider_GetSchema_ResponseErrorDiagnostic(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	client := mockproto.NewMockProviderClient(ctrl)
+
+	client.EXPECT().GetSchema(
+		gomock.Any(),
+		gomock.Any(),
+		gomock.Any(),
+	).Return(&proto.GetProviderSchema_Response{
+		Diagnostics: []*proto.Diagnostic{
+			{
+				Severity: proto.Diagnostic_ERROR,
+				Summary:  "error summary",
+				Detail:   "error detail",
+			},
+		},
+		// Trigger potential panics
+		Provider: &proto.Schema{},
+	}, nil)
+
+	p := &GRPCProvider{
+		client: client,
+	}
+
+	resp := p.GetProviderSchema()
+
+	checkDiagsHasError(t, resp.Diagnostics)
 }
 
 func TestGRPCProvider_PrepareProviderConfig(t *testing.T) {

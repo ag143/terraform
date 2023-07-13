@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package tfdiags
 
 type simpleWarning string
@@ -26,5 +29,10 @@ func (e simpleWarning) Source() Source {
 
 func (e simpleWarning) FromExpr() *FromExpr {
 	// Simple warnings are not expression-related
+	return nil
+}
+
+func (e simpleWarning) ExtraInfo() interface{} {
+	// Simple warnings cannot carry extra information.
 	return nil
 }

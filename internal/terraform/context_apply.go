@@ -1,15 +1,19 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package terraform
 
 import (
 	"fmt"
 	"log"
 
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
-	"github.com/zclconf/go-cty/cty"
 )
 
 // Apply performs the actions described by the given Plan object and returns
@@ -25,6 +29,29 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config) (*states.State
 
 	log.Printf("[DEBUG] Building and walking apply graph for %s plan", plan.UIMode)
 
+	if plan.Errored {
+		var diags tfdiags.Diagnostics
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Cannot apply failed plan",
+			`The given plan is incomplete due to errors during planning, and so it cannot be applied.`,
+		))
+		return nil, diags
+	}
+
+	for _, rc := range plan.Changes.Resources {
+		// Import is a no-op change during an apply (all the real action happens during the plan) but we'd
+		// like to show some helpful output that mirrors the way we show other changes.
+		if rc.Importing != nil {
+			for _, h := range c.hooks {
+				// In future, we may need to call PostApplyImport separately elsewhere in the apply
+				// operation. For now, though, we'll call Pre and Post hooks together.
+				h.PreApplyImport(rc.Addr, *rc.Importing)
+				h.PostApplyImport(rc.Addr, *rc.Importing)
+			}
+		}
+	}
+
 	graph, operation, diags := c.applyGraph(plan, config, true)
 	if diags.HasErrors() {
 		return nil, diags
@@ -35,10 +62,21 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config) (*states.State
 		Config:     config,
 		InputState: workingState,
 		Changes:    plan.Changes,
-		Conditions: plan.Conditions,
+
+		// We need to propagate the check results from the plan phase,
+		// because that will tell us which checkable objects we're expecting
+		// to see updated results from during the apply step.
+		PlanTimeCheckResults: plan.Checks,
+
+		// We also want to propagate the timestamp from the plan file.
+		PlanTimeTimestamp: plan.Timestamp,
 	})
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)
+
+	// After the walk is finished, we capture a simplified snapshot of the
+	// check result data as part of the new state.
+	walker.State.RecordCheckResults(walker.Checks)
 
 	newState := walker.State.Close()
 	if plan.UIMode == plans.DestroyMode && !diags.HasErrors() {
@@ -59,6 +97,21 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config) (*states.State
 	
 Note that the -target option is not suitable for routine use, and is provided only for exceptional situations such as recovering from errors or mistakes, or when Terraform specifically suggests to use it as part of an error message.`,
 		))
+	}
+
+	// FIXME: we cannot check for an empty plan for refresh-only, because root
+	// outputs are always stored as changes. The final condition of the state
+	// also depends on some cleanup which happens during the apply walk. It
+	// would probably make more sense if applying a refresh-only plan were
+	// simply just returning the planned state and checks, but some extra
+	// cleanup is going to be needed to make the plan state match what apply
+	// would do. For now we can copy the checks over which were overwritten
+	// during the apply walk.
+	// Despite the intent of UIMode, it must still be used for apply-time
+	// differences in destroy plans too, so we can make use of that here as
+	// well.
+	if plan.UIMode == plans.RefreshOnlyMode {
+		newState.CheckResults = plan.Checks.DeepCopy()
 	}
 
 	return newState, diags
@@ -103,6 +156,18 @@ func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, validate 
 		}
 	}
 
+	operation := walkApply
+	if plan.UIMode == plans.DestroyMode {
+		// FIXME: Due to differences in how objects must be handled in the
+		// graph and evaluated during a complete destroy, we must continue to
+		// use plans.DestroyMode to switch on this behavior. If all objects
+		// which require special destroy handling can be tracked in the plan,
+		// then this switch will no longer be needed and we can remove the
+		// walkDestroy operation mode.
+		// TODO: Audit that and remove walkDestroy as an operation mode.
+		operation = walkDestroy
+	}
+
 	graph, moreDiags := (&ApplyGraphBuilder{
 		Config:             config,
 		Changes:            plan.Changes,
@@ -111,20 +176,12 @@ func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, validate 
 		Plugins:            c.plugins,
 		Targets:            plan.TargetAddrs,
 		ForceReplace:       plan.ForceReplaceAddrs,
+		Operation:          operation,
+		ExternalReferences: plan.ExternalReferences,
 	}).Build(addrs.RootModuleInstance)
 	diags = diags.Append(moreDiags)
 	if moreDiags.HasErrors() {
 		return nil, walkApply, diags
-	}
-
-	operation := walkApply
-	if plan.UIMode == plans.DestroyMode {
-		// NOTE: This is a vestigial violation of the rule that we mustn't
-		// use plan.UIMode to affect apply-time behavior. It's a design error
-		// if anything downstream switches behavior when operation is set
-		// to walkDestroy, but we've not yet fully audited that.
-		// TODO: Audit that and remove walkDestroy as an operation mode.
-		operation = walkDestroy
 	}
 
 	return graph, operation, diags

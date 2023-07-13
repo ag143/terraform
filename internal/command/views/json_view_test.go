@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package views
 
 import (
@@ -8,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	viewsjson "github.com/hashicorp/terraform/internal/command/views/json"
 	"github.com/hashicorp/terraform/internal/plans"
@@ -96,6 +100,53 @@ func TestJSONView_Diagnostics(t *testing.T) {
 				"summary":  "Unusually stripey cat detected",
 				"detail":   "Are you sure this random_pet isn't a cheetah?",
 			},
+		},
+	}
+	testJSONViewOutputEquals(t, done(t).Stdout(), want)
+}
+
+func TestJSONView_DiagnosticsWithMetadata(t *testing.T) {
+	streams, done := terminal.StreamsForTesting(t)
+	jv := NewJSONView(NewView(streams))
+
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.Sourceless(
+		tfdiags.Warning,
+		`Improper use of "less"`,
+		`You probably mean "10 buckets or fewer"`,
+	))
+	diags = diags.Append(tfdiags.Sourceless(
+		tfdiags.Error,
+		"Unusually stripey cat detected",
+		"Are you sure this random_pet isn't a cheetah?",
+	))
+
+	jv.Diagnostics(diags, "@meta", "extra_info")
+
+	want := []map[string]interface{}{
+		{
+			"@level":   "warn",
+			"@message": `Warning: Improper use of "less"`,
+			"@module":  "terraform.ui",
+			"type":     "diagnostic",
+			"diagnostic": map[string]interface{}{
+				"severity": "warning",
+				"summary":  `Improper use of "less"`,
+				"detail":   `You probably mean "10 buckets or fewer"`,
+			},
+			"@meta": "extra_info",
+		},
+		{
+			"@level":   "error",
+			"@message": "Error: Unusually stripey cat detected",
+			"@module":  "terraform.ui",
+			"type":     "diagnostic",
+			"diagnostic": map[string]interface{}{
+				"severity": "error",
+				"summary":  "Unusually stripey cat detected",
+				"detail":   "Are you sure this random_pet isn't a cheetah?",
+			},
+			"@meta": "extra_info",
 		},
 	}
 	testJSONViewOutputEquals(t, done(t).Stdout(), want)
@@ -202,8 +253,39 @@ func TestJSONView_ChangeSummary(t *testing.T) {
 			"type":     "change_summary",
 			"changes": map[string]interface{}{
 				"add":       float64(1),
+				"import":    float64(0),
 				"change":    float64(2),
 				"remove":    float64(3),
+				"operation": "apply",
+			},
+		},
+	}
+	testJSONViewOutputEquals(t, done(t).Stdout(), want)
+}
+
+func TestJSONView_ChangeSummaryWithImport(t *testing.T) {
+	streams, done := terminal.StreamsForTesting(t)
+	jv := NewJSONView(NewView(streams))
+
+	jv.ChangeSummary(&viewsjson.ChangeSummary{
+		Add:       1,
+		Change:    2,
+		Remove:    3,
+		Import:    1,
+		Operation: viewsjson.OperationApplied,
+	})
+
+	want := []map[string]interface{}{
+		{
+			"@level":   "info",
+			"@message": "Apply complete! Resources: 1 imported, 1 added, 2 changed, 3 destroyed.",
+			"@module":  "terraform.ui",
+			"type":     "change_summary",
+			"changes": map[string]interface{}{
+				"add":       float64(1),
+				"change":    float64(2),
+				"remove":    float64(3),
+				"import":    float64(1),
 				"operation": "apply",
 			},
 		},

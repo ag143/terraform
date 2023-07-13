@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package tfdiags
 
 import (
@@ -51,6 +54,11 @@ func (d *rpcFriendlyDiag) Source() Source {
 func (d rpcFriendlyDiag) FromExpr() *FromExpr {
 	// RPC-friendly diagnostics cannot preserve expression information because
 	// expressions themselves are not RPC-friendly.
+	return nil
+}
+
+func (d rpcFriendlyDiag) ExtraInfo() interface{} {
+	// RPC-friendly diagnostics always discard any "extra information".
 	return nil
 }
 

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package addrs
 
 // UniqueKey is an interface implemented by values that serve as unique map
@@ -20,4 +23,8 @@ type UniqueKey interface {
 // proxy values.
 type UniqueKeyer interface {
 	UniqueKey() UniqueKey
+}
+
+func Equivalent[T UniqueKeyer](a, b T) bool {
+	return a.UniqueKey() == b.UniqueKey()
 }

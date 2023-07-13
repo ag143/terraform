@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package terraform
 
 import (
@@ -21,15 +24,16 @@ type ImportOpts struct {
 
 // ImportTarget is a single resource to import.
 type ImportTarget struct {
+	// Config is the original import block for this import. This might be null
+	// if the import did not originate in config.
+	Config *configs.Import
+
 	// Addr is the address for the resource instance that the new object should
 	// be imported into.
 	Addr addrs.AbsResourceInstance
 
 	// ID is the ID of the resource to import. This is resource-specific.
 	ID string
-
-	// ProviderAddr is the address of the provider that should handle the import.
-	ProviderAddr addrs.AbsProviderConfig
 }
 
 // Import takes already-created external resources and brings them
@@ -56,11 +60,13 @@ func (c *Context) Import(config *configs.Config, prevRunState *states.State, opt
 	variables := opts.SetVariables
 
 	// Initialize our graph builder
-	builder := &ImportGraphBuilder{
+	builder := &PlanGraphBuilder{
 		ImportTargets:      opts.Targets,
 		Config:             config,
+		State:              state,
 		RootVariableValues: variables,
 		Plugins:            c.plugins,
+		Operation:          walkImport,
 	}
 
 	// Build the graph
@@ -79,6 +85,11 @@ func (c *Context) Import(config *configs.Config, prevRunState *states.State, opt
 	if walkDiags.HasErrors() {
 		return state, diags
 	}
+
+	// Data sources which could not be read during the import plan will be
+	// unknown. We need to strip those objects out so that the state can be
+	// serialized.
+	walker.State.RemovePlannedResourceInstanceObjects()
 
 	newState := walker.State.Close()
 	return newState, diags

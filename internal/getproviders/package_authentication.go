@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package getproviders
 
 import (
@@ -9,12 +12,10 @@ import (
 	"log"
 	"strings"
 
-	// TODO: replace crypto/openpgp since it is deprecated
-	// https://github.com/golang/go/issues/44226
-	//lint:file-ignore SA1019 openpgp is deprecated but there are no good alternatives yet
-	"golang.org/x/crypto/openpgp"
-	openpgpArmor "golang.org/x/crypto/openpgp/armor"
-	openpgpErrors "golang.org/x/crypto/openpgp/errors"
+	"github.com/ProtonMail/go-crypto/openpgp"
+	openpgpArmor "github.com/ProtonMail/go-crypto/openpgp/armor"
+	openpgpErrors "github.com/ProtonMail/go-crypto/openpgp/errors"
+	openpgpPacket "github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
 type packageAuthenticationResult int
@@ -24,6 +25,12 @@ const (
 	officialProvider
 	partnerProvider
 	communityProvider
+)
+
+var (
+	// openpgpConfig is only populated during testing, so that a fake clock can be
+	// injected, preventing signature expiration errors.
+	openpgpConfig *openpgpPacket.Config
 )
 
 // PackageAuthenticationResult is returned from a PackageAuthentication
@@ -382,11 +389,11 @@ type signatureAuthentication struct {
 // in turn until one is successful. If such a key is found, there are three
 // possible successful authentication results:
 //
-// 1. If the signing key is the HashiCorp official key, it is an official
-//    provider;
-// 2. Otherwise, if the signing key has a trust signature from the HashiCorp
-//    Partners key, it is a partner provider;
-// 3. If neither of the above is true, it is a community provider.
+//  1. If the signing key is the HashiCorp official key, it is an official
+//     provider;
+//  2. Otherwise, if the signing key has a trust signature from the HashiCorp
+//     Partners key, it is a partner provider;
+//  3. If neither of the above is true, it is a community provider.
 //
 // Any failure in the process of validating the signature will result in an
 // unauthenticated result.
@@ -412,7 +419,7 @@ func (s signatureAuthentication) AuthenticatePackage(location PackageLocation) (
 	if err != nil {
 		return nil, fmt.Errorf("error creating HashiCorp keyring: %s", err)
 	}
-	_, err = openpgp.CheckDetachedSignature(hashicorpKeyring, bytes.NewReader(s.Document), bytes.NewReader(s.Signature))
+	_, err = openpgp.CheckDetachedSignature(hashicorpKeyring, bytes.NewReader(s.Document), bytes.NewReader(s.Signature), openpgpConfig)
 	if err == nil {
 		return &PackageAuthenticationResult{result: officialProvider, KeyID: keyID}, nil
 	}
@@ -435,7 +442,7 @@ func (s signatureAuthentication) AuthenticatePackage(location PackageLocation) (
 			return nil, fmt.Errorf("error decoding trust signature: %s", err)
 		}
 
-		_, err = openpgp.CheckDetachedSignature(hashicorpPartnersKeyring, authorKey.Body, trustSignature.Body)
+		_, err = openpgp.CheckDetachedSignature(hashicorpPartnersKeyring, authorKey.Body, trustSignature.Body, openpgpConfig)
 		if err != nil {
 			return nil, fmt.Errorf("error verifying trust signature: %s", err)
 		}
@@ -506,7 +513,7 @@ func (s signatureAuthentication) findSigningKey() (*SigningKey, string, error) {
 			return nil, "", fmt.Errorf("error decoding signing key: %s", err)
 		}
 
-		entity, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(s.Document), bytes.NewReader(s.Signature))
+		entity, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(s.Document), bytes.NewReader(s.Signature), openpgpConfig)
 
 		// If the signature issuer does not match the the key, keep trying the
 		// rest of the provided keys.

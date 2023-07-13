@@ -18,6 +18,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/go-version"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
@@ -1644,7 +1645,7 @@ func TestInit_providerSource(t *testing.T) {
 	})
 	defer close()
 
-	ui := new(cli.MockUi)
+	ui := cli.NewMockUi()
 	view, _ := testView(t)
 	m := Meta{
 		testingOverrides: metaOverridesForProvider(testProvider()),
@@ -1726,13 +1727,16 @@ func TestInit_providerSource(t *testing.T) {
 			},
 		),
 	}
+
 	if diff := cmp.Diff(gotProviderLocks, wantProviderLocks, depsfile.ProviderLockComparer); diff != "" {
 		t.Errorf("wrong version selections after upgrade\n%s", diff)
 	}
 
-	outputStr := ui.OutputWriter.String()
-	if want := "Installed hashicorp/test v1.2.3 (verified checksum)"; !strings.Contains(outputStr, want) {
-		t.Fatalf("unexpected output: %s\nexpected to include %q", outputStr, want)
+	if got, want := ui.OutputWriter.String(), "Installed hashicorp/test v1.2.3 (verified checksum)"; !strings.Contains(got, want) {
+		t.Fatalf("unexpected output: %s\nexpected to include %q", got, want)
+	}
+	if got, want := ui.ErrorWriter.String(), "\n  - hashicorp/source\n  - hashicorp/test\n  - hashicorp/test-beta"; !strings.Contains(got, want) {
+		t.Fatalf("wrong error message\nshould contain: %s\ngot:\n%s", want, got)
 	}
 }
 
@@ -2614,6 +2618,205 @@ func TestInit_invalidBuiltInProviders(t *testing.T) {
 	}
 	if subStr := "Cannot use terraform.io/builtin/nonexist: this Terraform release"; !strings.Contains(errStr, subStr) {
 		t.Errorf("error output should mention the 'nonexist' provider\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+}
+
+func TestInit_invalidSyntaxNoBackend(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("init-syntax-invalid-no-backend"), td)
+	defer testChdir(t, td)()
+
+	ui := cli.NewMockUi()
+	view, _ := testView(t)
+	m := Meta{
+		Ui:   ui,
+		View: view,
+	}
+
+	c := &InitCommand{
+		Meta: m,
+	}
+
+	if code := c.Run(nil); code == 0 {
+		t.Fatalf("succeeded, but was expecting error\nstdout:\n%s\nstderr:\n%s", ui.OutputWriter, ui.ErrorWriter)
+	}
+
+	errStr := ui.ErrorWriter.String()
+	if subStr := "There are some problems with the configuration, described below"; !strings.Contains(errStr, subStr) {
+		t.Errorf("Error output should include preamble\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+	if subStr := "Error: Unsupported block type"; !strings.Contains(errStr, subStr) {
+		t.Errorf("Error output should mention the syntax problem\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+}
+
+func TestInit_invalidSyntaxWithBackend(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("init-syntax-invalid-with-backend"), td)
+	defer testChdir(t, td)()
+
+	ui := cli.NewMockUi()
+	view, _ := testView(t)
+	m := Meta{
+		Ui:   ui,
+		View: view,
+	}
+
+	c := &InitCommand{
+		Meta: m,
+	}
+
+	if code := c.Run(nil); code == 0 {
+		t.Fatalf("succeeded, but was expecting error\nstdout:\n%s\nstderr:\n%s", ui.OutputWriter, ui.ErrorWriter)
+	}
+
+	errStr := ui.ErrorWriter.String()
+	if subStr := "There are some problems with the configuration, described below"; !strings.Contains(errStr, subStr) {
+		t.Errorf("Error output should include preamble\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+	if subStr := "Error: Unsupported block type"; !strings.Contains(errStr, subStr) {
+		t.Errorf("Error output should mention the syntax problem\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+}
+
+func TestInit_invalidSyntaxInvalidBackend(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("init-syntax-invalid-backend-invalid"), td)
+	defer testChdir(t, td)()
+
+	ui := cli.NewMockUi()
+	view, _ := testView(t)
+	m := Meta{
+		Ui:   ui,
+		View: view,
+	}
+
+	c := &InitCommand{
+		Meta: m,
+	}
+
+	if code := c.Run(nil); code == 0 {
+		t.Fatalf("succeeded, but was expecting error\nstdout:\n%s\nstderr:\n%s", ui.OutputWriter, ui.ErrorWriter)
+	}
+
+	errStr := ui.ErrorWriter.String()
+	if subStr := "There are some problems with the configuration, described below"; strings.Contains(errStr, subStr) {
+		t.Errorf("Error output should not include preamble\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+	if subStr := "Error: Unsupported block type"; strings.Contains(errStr, subStr) {
+		t.Errorf("Error output should not mention syntax errors\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+	if subStr := "Error: Unsupported backend type"; !strings.Contains(errStr, subStr) {
+		t.Errorf("Error output should mention the invalid backend\nwant substr: %s\ngot:\n%s", subStr, errStr)
+	}
+}
+
+func TestInit_tests(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("init-with-tests"), td)
+	defer testChdir(t, td)()
+
+	provider := applyFixtureProvider() // We just want the types from this provider.
+
+	providerSource, close := newMockProviderSource(t, map[string][]string{
+		"hashicorp/test": {"1.0.0"},
+	})
+	defer close()
+
+	ui := new(cli.MockUi)
+	view, _ := testView(t)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider),
+			Ui:               ui,
+			View:             view,
+			ProviderSource:   providerSource,
+		},
+	}
+
+	args := []string{}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+}
+
+func TestInit_testsWithProvider(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("init-with-tests-with-provider"), td)
+	defer testChdir(t, td)()
+
+	provider := applyFixtureProvider() // We just want the types from this provider.
+
+	providerSource, close := newMockProviderSource(t, map[string][]string{
+		"hashicorp/test": {"1.0.0"},
+	})
+	defer close()
+
+	ui := new(cli.MockUi)
+	view, _ := testView(t)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider),
+			Ui:               ui,
+			View:             view,
+			ProviderSource:   providerSource,
+		},
+	}
+
+	args := []string{}
+	if code := c.Run(args); code == 0 {
+		t.Fatalf("expected failure but got: \n%s", ui.OutputWriter.String())
+	}
+
+	got := ui.ErrorWriter.String()
+	want := `
+Error: Failed to query available provider packages
+
+Could not retrieve the list of available versions for provider
+hashicorp/test: no available releases match the given constraints 1.0.1,
+1.0.2
+
+`
+	if diff := cmp.Diff(got, want); len(diff) > 0 {
+		t.Fatalf("wrong error message: \ngot:\n%s\nwant:\n%s\ndiff:\n%s", got, want, diff)
+	}
+}
+
+func TestInit_testsWithModule(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("init-with-tests-with-module"), td)
+	defer testChdir(t, td)()
+
+	provider := applyFixtureProvider() // We just want the types from this provider.
+
+	providerSource, close := newMockProviderSource(t, map[string][]string{
+		"hashicorp/test": {"1.0.0"},
+	})
+	defer close()
+
+	ui := new(cli.MockUi)
+	view, _ := testView(t)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider),
+			Ui:               ui,
+			View:             view,
+			ProviderSource:   providerSource,
+		},
+	}
+
+	args := []string{}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+
+	// Check output
+	output := ui.OutputWriter.String()
+	if !strings.Contains(output, "test.main.setup in setup") {
+		t.Fatalf("doesn't look like we installed the test module': %s", output)
 	}
 }
 

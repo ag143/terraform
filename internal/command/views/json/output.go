@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package json
 
 import (
@@ -42,10 +45,15 @@ func OutputsFromMap(outputValues map[string]*states.OutputValue) (Outputs, tfdia
 			return nil, diags
 		}
 
+		var redactedValue json.RawMessage
+		if !ov.Sensitive {
+			redactedValue = json.RawMessage(value)
+		}
+
 		outputs[name] = Output{
 			Sensitive: ov.Sensitive,
 			Type:      json.RawMessage(valueType),
-			Value:     json.RawMessage(value),
+			Value:     redactedValue,
 		}
 	}
 

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package main
 
 import (
@@ -84,6 +87,9 @@ func realMain() int {
 	}
 	log.Printf("[INFO] Go runtime version: %s", runtime.Version())
 	log.Printf("[INFO] CLI args: %#v", os.Args)
+	if ExperimentsAllowed() {
+		log.Printf("[INFO] This build of Terraform allows using experimental features")
+	}
 
 	streams, err := terminal.Init()
 	if err != nil {

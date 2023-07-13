@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package azure
 
 import (
@@ -93,7 +96,6 @@ func buildTestClient(t *testing.T, res resourceNames) *ArmClient {
 		StorageAccountName:            res.storageAccountName,
 		UseMsi:                        msiEnabled,
 		UseAzureADAuthentication:      res.useAzureADAuth,
-		UseMicrosoftGraph:             res.useMicrosoftGraph,
 	})
 	if err != nil {
 		t.Fatalf("Failed to build ArmClient: %+v", err)
@@ -137,7 +139,6 @@ type resourceNames struct {
 	storageKeyName          string
 	storageAccountAccessKey string
 	useAzureADAuth          bool
-	useMicrosoftGraph       bool
 }
 
 func testResourceNames(rString string, keyName string) resourceNames {

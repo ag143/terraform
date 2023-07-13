@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package addrs
 
 import (
@@ -124,7 +127,7 @@ func TestProviderDisplay(t *testing.T) {
 	}
 }
 
-func TestProviderIsDefault(t *testing.T) {
+func TestProviderIsDefaultProvider(t *testing.T) {
 	tests := []struct {
 		Input Provider
 		Want  bool
@@ -156,7 +159,7 @@ func TestProviderIsDefault(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		got := test.Input.IsDefault()
+		got := IsDefaultProvider(test.Input)
 		if got != test.Want {
 			t.Errorf("wrong result for %s\n", test.Input.String())
 		}

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package plans
 
 import (
@@ -19,24 +22,6 @@ import (
 type ChangesSync struct {
 	lock    sync.Mutex
 	changes *Changes
-}
-
-// IsFullDestroy returns true if the set of changes indicates we are doing a
-// destroy of all resources.
-func (cs *ChangesSync) IsFullDestroy() bool {
-	if cs == nil {
-		panic("FullDestroy on nil ChangesSync")
-	}
-	cs.lock.Lock()
-	defer cs.lock.Unlock()
-
-	for _, c := range cs.changes.Resources {
-		if c.Action != Delete {
-			return false
-		}
-	}
-
-	return true
 }
 
 // AppendResourceInstanceChange records the given resource instance change in
@@ -183,6 +168,22 @@ func (cs *ChangesSync) GetOutputChange(addr addrs.AbsOutputValue) *OutputChangeS
 	defer cs.lock.Unlock()
 
 	return cs.changes.OutputValue(addr)
+}
+
+// GetRootOutputChanges searches the set of output changes for any that reside
+// the root module. If no such changes exist, nil is returned.
+//
+// The returned objects are a deep copy of the change recorded in the plan, so
+// callers may mutate them although it's generally better (less confusing) to
+// treat planned changes as immutable after they've been initially constructed.
+func (cs *ChangesSync) GetRootOutputChanges() []*OutputChangeSrc {
+	if cs == nil {
+		panic("GetRootOutputChanges on nil ChangesSync")
+	}
+	cs.lock.Lock()
+	defer cs.lock.Unlock()
+
+	return cs.changes.RootOutputValues()
 }
 
 // GetOutputChanges searches the set of output changes for any that reside in

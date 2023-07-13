@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package tfdiags
 
 // nativeError is a Diagnostic implementation that wraps a normal Go error
@@ -24,5 +27,10 @@ func (e nativeError) Source() Source {
 
 func (e nativeError) FromExpr() *FromExpr {
 	// Native errors are not expression-related
+	return nil
+}
+
+func (e nativeError) ExtraInfo() interface{} {
+	// Native errors don't carry any "extra information".
 	return nil
 }

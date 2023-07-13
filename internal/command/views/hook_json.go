@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package views
 
 import (
@@ -7,13 +10,14 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command/format"
 	"github.com/hashicorp/terraform/internal/command/views/json"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/terraform"
-	"github.com/zclconf/go-cty/cty"
 )
 
 // How long to wait between sending heartbeat/progress messages
@@ -59,8 +63,10 @@ type applyProgress struct {
 }
 
 func (h *jsonHook) PreApply(addr addrs.AbsResourceInstance, gen states.Generation, action plans.Action, priorState, plannedNewState cty.Value) (terraform.HookAction, error) {
-	idKey, idValue := format.ObjectValueIDOrName(priorState)
-	h.view.Hook(json.NewApplyStart(addr, action, idKey, idValue))
+	if action != plans.NoOp {
+		idKey, idValue := format.ObjectValueIDOrName(priorState)
+		h.view.Hook(json.NewApplyStart(addr, action, idKey, idValue))
+	}
 
 	progress := applyProgress{
 		addr:          addr,
@@ -73,7 +79,9 @@ func (h *jsonHook) PreApply(addr addrs.AbsResourceInstance, gen states.Generatio
 	h.applying[addr.String()] = progress
 	h.applyingLock.Unlock()
 
-	go h.applyingHeartbeat(progress)
+	if action != plans.NoOp {
+		go h.applyingHeartbeat(progress)
+	}
 	return terraform.HookActionContinue, nil
 }
 
@@ -100,6 +108,10 @@ func (h *jsonHook) PostApply(addr addrs.AbsResourceInstance, gen states.Generati
 	}
 	delete(h.applying, key)
 	h.applyingLock.Unlock()
+
+	if progress.action == plans.NoOp {
+		return terraform.HookActionContinue, nil
+	}
 
 	elapsed := h.timeNow().Round(time.Second).Sub(progress.start)
 

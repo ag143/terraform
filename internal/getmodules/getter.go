@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package getmodules
 
 import (
@@ -83,8 +86,9 @@ var goGetterGetters = map[string]getter.Getter{
 var getterHTTPClient = cleanhttp.DefaultClient()
 
 var getterHTTPGetter = &getter.HttpGetter{
-	Client: getterHTTPClient,
-	Netrc:  true,
+	Client:             getterHTTPClient,
+	Netrc:              true,
+	XTerraformGetLimit: 10,
 }
 
 // A reusingGetter is a helper for the module installer that remembers

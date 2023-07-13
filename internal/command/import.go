@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package command
 
 import (
@@ -45,7 +48,6 @@ func (c *ImportCommand) Run(args []string) int {
 	cmdFlags.StringVar(&configPath, "config", pwd, "path")
 	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
 	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
-	cmdFlags.BoolVar(&c.Meta.allowMissingConfig, "allow-missing-config", false, "allow missing config")
 	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
 	if err := cmdFlags.Parse(args); err != nil {
 		return 1
@@ -135,7 +137,7 @@ func (c *ImportCommand) Run(args []string) int {
 			break
 		}
 	}
-	if !c.Meta.allowMissingConfig && rc == nil {
+	if rc == nil {
 		modulePath := addr.Module.String()
 		if modulePath == "" {
 			modulePath = "the root module"
@@ -183,7 +185,7 @@ func (c *ImportCommand) Run(args []string) int {
 	}
 
 	// Build the operation
-	opReq := c.Operation(b)
+	opReq := c.Operation(b, arguments.ViewHuman)
 	opReq.ConfigDir = configPath
 	opReq.ConfigLoader, err = c.initConfigLoader()
 	if err != nil {
@@ -249,22 +251,26 @@ func (c *ImportCommand) Run(args []string) int {
 		return 1
 	}
 
+	// Get schemas, if possible, before writing state
+	var schemas *terraform.Schemas
+	if isCloudMode(b) {
+		var schemaDiags tfdiags.Diagnostics
+		schemas, schemaDiags = c.MaybeGetSchemas(newState, nil)
+		diags = diags.Append(schemaDiags)
+	}
+
 	// Persist the final state
 	log.Printf("[INFO] Writing state output to: %s", c.Meta.StateOutPath())
 	if err := state.WriteState(newState); err != nil {
 		c.Ui.Error(fmt.Sprintf("Error writing state file: %s", err))
 		return 1
 	}
-	if err := state.PersistState(); err != nil {
+	if err := state.PersistState(schemas); err != nil {
 		c.Ui.Error(fmt.Sprintf("Error writing state file: %s", err))
 		return 1
 	}
 
 	c.Ui.Output(c.Colorize().Color("[reset][green]\n" + importCommandSuccessMsg))
-
-	if c.Meta.allowMissingConfig && rc == nil {
-		c.Ui.Output(c.Colorize().Color("[reset][yellow]\n" + importCommandAllowMissingResourceMsg))
-	}
 
 	c.showDiagnostics(diags)
 	if diags.HasErrors() {
@@ -291,14 +297,6 @@ Usage: terraform [global options] import [options] ADDR ID
   determine the ID syntax to use. It typically matches directly to the ID
   that the provider uses.
 
-  The current implementation of Terraform import can only import resources
-  into the state. It does not generate configuration. A future version of
-  Terraform will also generate configuration.
-
-  Because of this, prior to running terraform import it is necessary to write
-  a resource configuration block for the resource manually, to which the
-  imported object will be attached.
-
   This command will not modify your infrastructure, but it will make
   network requests to inspect parts of your infrastructure relevant to
   the resource being imported.
@@ -309,8 +307,6 @@ Options:
                           to use to configure the provider. Defaults to pwd.
                           If no config files are present, they must be provided
                           via the input prompts or env vars.
-
-  -allow-missing-config   Allow import when no resource configuration block exists.
 
   -input=false            Disable interactive input prompts.
 
@@ -360,13 +356,4 @@ const importCommandSuccessMsg = `Import successful!
 
 The resources that were imported are shown above. These resources are now in
 your Terraform state and will henceforth be managed by Terraform.
-`
-
-const importCommandAllowMissingResourceMsg = `Import does not generate resource configuration, you must create a resource
-configuration block that matches the current or desired state manually.
-
-If there is no matching resource configuration block for the imported
-resource, Terraform will delete the resource on the next "terraform apply".
-It is recommended that you run "terraform plan" to verify that the
-configuration is correct and complete.
 `

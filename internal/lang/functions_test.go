@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package lang
 
 import (
@@ -5,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -291,18 +295,6 @@ func TestFunctions(t *testing.T) {
 			},
 		},
 
-		"defaults": {
-			// This function is pretty specialized and so this is mainly
-			// just a test that it is defined at all. See the function's
-			// own unit tests for more interesting test cases.
-			{
-				`defaults({a: 4}, {a: 5})`,
-				cty.ObjectVal(map[string]cty.Value{
-					"a": cty.NumberIntVal(4),
-				}),
-			},
-		},
-
 		"dirname": {
 			{
 				`dirname("testdata/hello.txt")`,
@@ -323,6 +315,47 @@ func TestFunctions(t *testing.T) {
 			{
 				`element(["hello"], 0)`,
 				cty.StringVal("hello"),
+			},
+		},
+
+		"endswith": {
+			{
+				`endswith("hello world", "world")`,
+				cty.True,
+			},
+			{
+				`endswith("hello world", "hello")`,
+				cty.False,
+			},
+			{
+				`endswith("hello world", "")`,
+				cty.True,
+				// Completely empty suffix value  ( "" )
+				// will always evaluate to true for all strings.
+			},
+			{
+				`endswith("hello world", " ")`,
+				cty.False,
+			},
+			{
+				`endswith("", "")`,
+				cty.True,
+			},
+			{
+				`endswith("", " ")`,
+				cty.False,
+			},
+			{
+				`endswith(" ", "")`,
+				cty.True,
+			},
+			{
+				`endswith("", "hello")`,
+				cty.False,
+			},
+			{
+				`endswith(" ", "hello")`,
+				cty.False,
 			},
 		},
 
@@ -640,6 +673,13 @@ func TestFunctions(t *testing.T) {
 			},
 		},
 
+		"plantimestamp": {
+			{
+				`plantimestamp()`,
+				cty.StringVal("2004-04-25T15:00:00Z"),
+			},
+		},
+
 		"pow": {
 			{
 				`pow(1,0)`,
@@ -828,6 +868,58 @@ func TestFunctions(t *testing.T) {
 			},
 		},
 
+		"startswith": {
+			{
+				`startswith("hello world", "hello")`,
+				cty.True,
+			},
+			{
+				`startswith("hello world", "world")`,
+				cty.False,
+			},
+			{
+				`startswith("hello world", "")`,
+				cty.True,
+				// Completely empty prefix value  ( "" )
+				// will always evaluate to true for all strings.
+			},
+			{
+				`startswith("hello world", " ")`,
+				cty.False,
+			},
+			{
+				`startswith("", "")`,
+				cty.True,
+			},
+			{
+				`startswith("", " ")`,
+				cty.False,
+			},
+			{
+				`startswith(" ", "")`,
+				cty.True,
+			},
+			{
+				`startswith("", "hello")`,
+				cty.False,
+			},
+			{
+				`startswith(" ", "hello")`,
+				cty.False,
+			},
+		},
+
+		"strcontains": {
+			{
+				`strcontains("hello", "llo")`,
+				cty.BoolVal(true),
+			},
+			{
+				`strcontains("hello", "a")`,
+				cty.BoolVal(false),
+			},
+		},
+
 		"strrev": {
 			{
 				`strrev("hello world")`,
@@ -874,6 +966,13 @@ func TestFunctions(t *testing.T) {
 			{
 				`timeadd("2017-11-22T00:00:00Z", "1s")`,
 				cty.StringVal("2017-11-22T00:00:01Z"),
+			},
+		},
+
+		"timecmp": {
+			{
+				`timecmp("2017-11-22T00:00:00Z", "2017-11-22T00:00:00Z")`,
+				cty.Zero,
 			},
 		},
 
@@ -1054,6 +1153,10 @@ func TestFunctions(t *testing.T) {
 					"key": cty.StringVal("0ba"),
 				}),
 			},
+			{
+				`yamldecode("~")`,
+				cty.NullVal(cty.DynamicPseudoType),
+			},
 		},
 
 		"yamlencode": {
@@ -1161,8 +1264,9 @@ func TestFunctions(t *testing.T) {
 				t.Run(test.src, func(t *testing.T) {
 					data := &dataForTests{} // no variables available; we only need literals here
 					scope := &Scope{
-						Data:    data,
-						BaseDir: "./testdata/functions-test", // for the functions that read from the filesystem
+						Data:          data,
+						BaseDir:       "./testdata/functions-test", // for the functions that read from the filesystem
+						PlanTimestamp: time.Date(2004, 04, 25, 15, 00, 00, 000, time.UTC),
 					}
 					prepareScope(t, scope)
 

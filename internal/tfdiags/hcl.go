@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package tfdiags
 
 import (
@@ -48,6 +51,10 @@ func (d hclDiagnostic) FromExpr() *FromExpr {
 		Expression:  d.diag.Expression,
 		EvalContext: d.diag.EvalContext,
 	}
+}
+
+func (d hclDiagnostic) ExtraInfo() interface{} {
+	return d.diag.Extra
 }
 
 // SourceRangeFromHCL constructs a SourceRange from the corresponding range

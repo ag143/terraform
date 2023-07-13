@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package regsrc
 
 import (
@@ -105,7 +108,7 @@ func NewModule(host, namespace, name, provider, submodule string) (*Module, erro
 // use addrs.ModuleSourceRegistry instead, and then package regsrc can be
 // removed altogether.
 func ModuleFromModuleSourceAddr(addr addrs.ModuleSourceRegistry) *Module {
-	ret := ModuleFromRegistryPackageAddr(addr.PackageAddr)
+	ret := ModuleFromRegistryPackageAddr(addr.Package)
 	ret.RawSubmodule = addr.Subdir
 	return ret
 }

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package plugin6
 
 import (
@@ -9,10 +12,10 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	plugin "github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/plugin6/convert"
 	"github.com/hashicorp/terraform/internal/providers"
-	"github.com/hashicorp/terraform/internal/tfdiags"
 	proto6 "github.com/hashicorp/terraform/internal/tfplugin6"
 	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"github.com/zclconf/go-cty/cty/msgpack"
@@ -52,6 +55,11 @@ type GRPCProvider struct {
 	// used in an end to end test of a provider.
 	TestServer *grpc.Server
 
+	// Addr uniquely identifies the type of provider.
+	// Normally executed providers will have this set during initialization,
+	// but it may not always be available for alternative execute modes.
+	Addr addrs.Provider
+
 	// Proto client use to make the grpc service calls.
 	client proto6.ProviderClient
 
@@ -65,63 +73,17 @@ type GRPCProvider struct {
 	schemas providers.GetProviderSchemaResponse
 }
 
-func New(client proto6.ProviderClient, ctx context.Context) GRPCProvider {
-	return GRPCProvider{
-		client: client,
-		ctx:    ctx,
-	}
-}
-
-// getSchema is used internally to get the cached provider schema.
-func (p *GRPCProvider) getSchema() providers.GetProviderSchemaResponse {
-	p.mu.Lock()
-	// unlock inline in case GetProviderSchema needs to be called
-	if p.schemas.Provider.Block != nil {
-		p.mu.Unlock()
-		return p.schemas
-	}
-	p.mu.Unlock()
-
-	return p.GetProviderSchema()
-}
-
-// getResourceSchema is a helper to extract the schema for a resource, and
-// panics if the schema is not available.
-func (p *GRPCProvider) getResourceSchema(name string) (providers.Schema, tfdiags.Diagnostics) {
-	schema := p.getSchema()
-	resSchema, ok := schema.ResourceTypes[name]
-	if !ok {
-		schema.Diagnostics = schema.Diagnostics.Append(fmt.Errorf("unknown resource type " + name))
-	}
-	return resSchema, schema.Diagnostics
-}
-
-// gettDatasourceSchema is a helper to extract the schema for a datasource, and
-// panics if that schema is not available.
-func (p *GRPCProvider) getDatasourceSchema(name string) (providers.Schema, tfdiags.Diagnostics) {
-	schema := p.getSchema()
-	if schema.Diagnostics.HasErrors() {
-		return providers.Schema{}, schema.Diagnostics
-	}
-
-	dataSchema, ok := schema.DataSources[name]
-	if !ok {
-		schema.Diagnostics = schema.Diagnostics.Append(fmt.Errorf("unknown data source " + name))
-	}
-	return dataSchema, schema.Diagnostics
-}
-
-// getProviderMetaSchema is a helper to extract the schema for the meta info
-// defined for a provider,
-func (p *GRPCProvider) getProviderMetaSchema() (providers.Schema, tfdiags.Diagnostics) {
-	schema := p.getSchema()
-	return schema.ProviderMeta, schema.Diagnostics
-}
-
 func (p *GRPCProvider) GetProviderSchema() (resp providers.GetProviderSchemaResponse) {
 	logger.Trace("GRPCProvider.v6: GetProviderSchema")
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// check the global cache if we can
+	if !p.Addr.IsZero() {
+		if resp, ok := providers.SchemaCache.Get(p.Addr); ok {
+			return resp
+		}
+	}
 
 	if p.schemas.Provider.Block != nil {
 		return p.schemas
@@ -134,7 +96,10 @@ func (p *GRPCProvider) GetProviderSchema() (resp providers.GetProviderSchemaResp
 	// grpc response size limit is 4MB. 64MB should cover most any use case, and
 	// if we get providers nearing that we may want to consider a finer-grained
 	// API to fetch individual resource schemas.
-	// Note: this option is marked as EXPERIMENTAL in the grpc API.
+	// Note: this option is marked as EXPERIMENTAL in the grpc API. We keep
+	// this for compatibility, but recent providers all set the max message
+	// size much higher on the server side, which is the supported method for
+	// determining payload size.
 	const maxRecvSize = 64 << 20
 	protoResp, err := p.client.GetProviderSchema(p.ctx, new(proto6.GetProviderSchema_Request), grpc.MaxRecvMsgSizeCallOption{MaxRecvMsgSize: maxRecvSize})
 	if err != nil {
@@ -143,6 +108,10 @@ func (p *GRPCProvider) GetProviderSchema() (resp providers.GetProviderSchemaResp
 	}
 
 	resp.Diagnostics = resp.Diagnostics.Append(convert.ProtoToDiagnostics(protoResp.Diagnostics))
+
+	if resp.Diagnostics.HasErrors() {
+		return resp
+	}
 
 	if protoResp.Provider == nil {
 		resp.Diagnostics = resp.Diagnostics.Append(errors.New("missing provider schema"))
@@ -164,6 +133,19 @@ func (p *GRPCProvider) GetProviderSchema() (resp providers.GetProviderSchemaResp
 		resp.DataSources[name] = convert.ProtoToProviderSchema(data)
 	}
 
+	if protoResp.ServerCapabilities != nil {
+		resp.ServerCapabilities.PlanDestroy = protoResp.ServerCapabilities.PlanDestroy
+	}
+
+	// FIXME: Waiting for a provider capability to prevent caching
+	//        providers which always need GetProviderSchema called.
+	// set the global cache if we can
+	//if !p.Addr.IsZero() {
+	//    providers.SchemaCache.Set(p.Addr, resp)
+	//} else {
+	//    // otherwise store it in the local cache
+	//    p.schemas = resp
+	//}
 	p.schemas = resp
 
 	return resp
@@ -172,7 +154,12 @@ func (p *GRPCProvider) GetProviderSchema() (resp providers.GetProviderSchemaResp
 func (p *GRPCProvider) ValidateProviderConfig(r providers.ValidateProviderConfigRequest) (resp providers.ValidateProviderConfigResponse) {
 	logger.Trace("GRPCProvider.v6: ValidateProviderConfig")
 
-	schema := p.getSchema()
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
+		return resp
+	}
+
 	ty := schema.Provider.Block.ImpliedType()
 
 	mp, err := msgpack.Marshal(r.Config, ty)
@@ -198,9 +185,15 @@ func (p *GRPCProvider) ValidateProviderConfig(r providers.ValidateProviderConfig
 func (p *GRPCProvider) ValidateResourceConfig(r providers.ValidateResourceConfigRequest) (resp providers.ValidateResourceConfigResponse) {
 	logger.Trace("GRPCProvider.v6: ValidateResourceConfig")
 
-	resourceSchema, diags := p.getResourceSchema(r.TypeName)
-	if diags.HasErrors() {
-		resp.Diagnostics = resp.Diagnostics.Append(diags)
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
+		return resp
+	}
+
+	resourceSchema, ok := schema.ResourceTypes[r.TypeName]
+	if !ok {
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("unknown resource type %q", r.TypeName))
 		return resp
 	}
 
@@ -228,9 +221,15 @@ func (p *GRPCProvider) ValidateResourceConfig(r providers.ValidateResourceConfig
 func (p *GRPCProvider) ValidateDataResourceConfig(r providers.ValidateDataResourceConfigRequest) (resp providers.ValidateDataResourceConfigResponse) {
 	logger.Trace("GRPCProvider.v6: ValidateDataResourceConfig")
 
-	dataSchema, diags := p.getDatasourceSchema(r.TypeName)
-	if diags.HasErrors() {
-		resp.Diagnostics = resp.Diagnostics.Append(diags)
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
+		return resp
+	}
+
+	dataSchema, ok := schema.DataSources[r.TypeName]
+	if !ok {
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("unknown data source %q", r.TypeName))
 		return resp
 	}
 
@@ -257,9 +256,15 @@ func (p *GRPCProvider) ValidateDataResourceConfig(r providers.ValidateDataResour
 func (p *GRPCProvider) UpgradeResourceState(r providers.UpgradeResourceStateRequest) (resp providers.UpgradeResourceStateResponse) {
 	logger.Trace("GRPCProvider.v6: UpgradeResourceState")
 
-	resSchema, diags := p.getResourceSchema(r.TypeName)
-	if diags.HasErrors() {
-		resp.Diagnostics = resp.Diagnostics.Append(diags)
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
+		return resp
+	}
+
+	resSchema, ok := schema.ResourceTypes[r.TypeName]
+	if !ok {
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("unknown resource type %q", r.TypeName))
 		return resp
 	}
 
@@ -298,7 +303,7 @@ func (p *GRPCProvider) UpgradeResourceState(r providers.UpgradeResourceStateRequ
 func (p *GRPCProvider) ConfigureProvider(r providers.ConfigureProviderRequest) (resp providers.ConfigureProviderResponse) {
 	logger.Trace("GRPCProvider.v6: ConfigureProvider")
 
-	schema := p.getSchema()
+	schema := p.GetProviderSchema()
 
 	var mp []byte
 
@@ -342,13 +347,19 @@ func (p *GRPCProvider) Stop() error {
 func (p *GRPCProvider) ReadResource(r providers.ReadResourceRequest) (resp providers.ReadResourceResponse) {
 	logger.Trace("GRPCProvider.v6: ReadResource")
 
-	resSchema, diags := p.getResourceSchema(r.TypeName)
-	metaSchema, metaDiags := p.getProviderMetaSchema()
-	diags = diags.Append(metaDiags)
-	if diags.HasErrors() {
-		resp.Diagnostics = resp.Diagnostics.Append(diags)
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
 		return resp
 	}
+
+	resSchema, ok := schema.ResourceTypes[r.TypeName]
+	if !ok {
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("unknown resource type " + r.TypeName))
+		return resp
+	}
+
+	metaSchema := schema.ProviderMeta
 
 	mp, err := msgpack.Marshal(r.PriorState, resSchema.Block.ImpliedType())
 	if err != nil {
@@ -392,11 +403,26 @@ func (p *GRPCProvider) ReadResource(r providers.ReadResourceRequest) (resp provi
 func (p *GRPCProvider) PlanResourceChange(r providers.PlanResourceChangeRequest) (resp providers.PlanResourceChangeResponse) {
 	logger.Trace("GRPCProvider.v6: PlanResourceChange")
 
-	resSchema, diags := p.getResourceSchema(r.TypeName)
-	metaSchema, metaDiags := p.getProviderMetaSchema()
-	diags = diags.Append(metaDiags)
-	if diags.HasErrors() {
-		resp.Diagnostics = resp.Diagnostics.Append(diags)
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
+		return resp
+	}
+
+	resSchema, ok := schema.ResourceTypes[r.TypeName]
+	if !ok {
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("unknown resource type %q", r.TypeName))
+		return resp
+	}
+
+	metaSchema := schema.ProviderMeta
+	capabilities := schema.ServerCapabilities
+
+	// If the provider doesn't support planning a destroy operation, we can
+	// return immediately.
+	if r.ProposedNewState.IsNull() && !capabilities.PlanDestroy {
+		resp.PlannedState = r.ProposedNewState
+		resp.PlannedPrivate = r.PriorPrivate
 		return resp
 	}
 
@@ -463,13 +489,19 @@ func (p *GRPCProvider) PlanResourceChange(r providers.PlanResourceChangeRequest)
 func (p *GRPCProvider) ApplyResourceChange(r providers.ApplyResourceChangeRequest) (resp providers.ApplyResourceChangeResponse) {
 	logger.Trace("GRPCProvider.v6: ApplyResourceChange")
 
-	resSchema, diags := p.getResourceSchema(r.TypeName)
-	metaSchema, metaDiags := p.getProviderMetaSchema()
-	diags = diags.Append(metaDiags)
-	if diags.HasErrors() {
-		resp.Diagnostics = resp.Diagnostics.Append(diags)
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
 		return resp
 	}
+
+	resSchema, ok := schema.ResourceTypes[r.TypeName]
+	if !ok {
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("unknown resource type %q", r.TypeName))
+		return resp
+	}
+
+	metaSchema := schema.ProviderMeta
 
 	priorMP, err := msgpack.Marshal(r.PriorState, resSchema.Block.ImpliedType())
 	if err != nil {
@@ -528,6 +560,12 @@ func (p *GRPCProvider) ApplyResourceChange(r providers.ApplyResourceChangeReques
 func (p *GRPCProvider) ImportResourceState(r providers.ImportResourceStateRequest) (resp providers.ImportResourceStateResponse) {
 	logger.Trace("GRPCProvider.v6: ImportResourceState")
 
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
+		return resp
+	}
+
 	protoReq := &proto6.ImportResourceState_Request{
 		TypeName: r.TypeName,
 		Id:       r.ID,
@@ -546,10 +584,10 @@ func (p *GRPCProvider) ImportResourceState(r providers.ImportResourceStateReques
 			Private:  imported.Private,
 		}
 
-		resSchema, diags := p.getResourceSchema(resource.TypeName)
-		if diags.HasErrors() {
-			resp.Diagnostics = resp.Diagnostics.Append(diags)
-			return resp
+		resSchema, ok := schema.ResourceTypes[r.TypeName]
+		if !ok {
+			resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("unknown resource type %q", r.TypeName))
+			continue
 		}
 
 		state, err := decodeDynamicValue(imported.State, resSchema.Block.ImpliedType())
@@ -567,13 +605,18 @@ func (p *GRPCProvider) ImportResourceState(r providers.ImportResourceStateReques
 func (p *GRPCProvider) ReadDataSource(r providers.ReadDataSourceRequest) (resp providers.ReadDataSourceResponse) {
 	logger.Trace("GRPCProvider.v6: ReadDataSource")
 
-	dataSchema, diags := p.getDatasourceSchema(r.TypeName)
-	metaSchema, metaDiags := p.getProviderMetaSchema()
-	diags = diags.Append(metaDiags)
-	if diags.HasErrors() {
-		resp.Diagnostics = resp.Diagnostics.Append(diags)
+	schema := p.GetProviderSchema()
+	if schema.Diagnostics.HasErrors() {
+		resp.Diagnostics = schema.Diagnostics
 		return resp
 	}
+
+	dataSchema, ok := schema.DataSources[r.TypeName]
+	if !ok {
+		schema.Diagnostics = schema.Diagnostics.Append(fmt.Errorf("unknown data source %q", r.TypeName))
+	}
+
+	metaSchema := schema.ProviderMeta
 
 	config, err := msgpack.Marshal(r.Config, dataSchema.Block.ImpliedType())
 	if err != nil {

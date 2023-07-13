@@ -7,10 +7,9 @@ description: >-
 
 # The `lifecycle` Meta-Argument
 
-> **Hands-on:** Try the [Lifecycle Management](https://learn.hashicorp.com/tutorials/terraform/resource-lifecycle?utm_source=WEBSITE&utm_medium=WEB_IO&utm_offer=ARTICLE_PAGE&utm_content=DOCS) tutorial on HashiCorp Learn.
+> **Hands-on:** Try the [Lifecycle Management](/terraform/tutorials/state/resource-lifecycle?utm_source=WEBSITE&utm_medium=WEB_IO&utm_offer=ARTICLE_PAGE&utm_content=DOCS) tutorial.
 
-The general lifecycle for resources is described in the
-[Resource Behavior](/language/resources/behavior) page. Some details of
+The [Resource Behavior](/terraform/language/resources/behavior) page describes the general lifecycle for resources. Some details of
 that behavior can be customized using the special nested `lifecycle` block
 within a resource block body:
 
@@ -30,7 +29,8 @@ resource "azurerm_resource_group" "example" {
 The `lifecycle` block and its contents are meta-arguments, available
 for all `resource` blocks regardless of type.
 
-The following arguments can be used within a `lifecycle` block:
+The arguments available within a `lifecycle` block are `create_before_destroy`,
+`prevent_destroy`, `ignore_changes`, and `replace_triggered_by`.
 
 * `create_before_destroy` (bool) - By default, when Terraform must change
   a resource argument that cannot be updated in-place due to
@@ -49,8 +49,8 @@ The following arguments can be used within a `lifecycle` block:
   such features, so you must understand the constraints for each resource
   type before using `create_before_destroy` with it.
 
-  Destroy provisioners of this resource will not run if `create_before_destroy`
-  is set to `true`. We may address this in the future, and this [GitHub issue](https://github.com/hashicorp/terraform/issues/13549) contains more details.
+  Destroy provisioners of this resource do not run if `create_before_destroy`
+  is set to `true`. This [GitHub issue](https://github.com/hashicorp/terraform/issues/13549) contains more details.
 
 * `prevent_destroy` (bool) - This meta-argument, when set to `true`, will
   cause Terraform to reject with an error any plan that would destroy the
@@ -110,9 +110,16 @@ The following arguments can be used within a `lifecycle` block:
   Only attributes defined by the resource type can be ignored.
   `ignore_changes` cannot be applied to itself or to any other meta-arguments.
 
-* `replace_triggered_by` (list of resource references) - Forces Terraform to replace the parent resource when there is a change to a referenced resource or resource attribute. Supply a list of expressions referencing managed resources, instances, or instance attributes. When the containing resource uses `count` or `for_each`, you can use `count.index` or `each.key` in the expression to index specific instances. 
+* `replace_triggered_by` (list of resource or attribute references) -
+  _Added in Terraform 1.2._ Replaces the resource when any of the referenced
+  items change. Supply a list of expressions referencing managed resources,
+  instances, or instance attributes. When used in a resource that uses `count`
+  or `for_each`, you can use `count.index` or `each.key` in the expression to
+  reference specific instances of other resources that are configured with the
+  same count or collection.
 
-References trigger replacement in the following conditions:
+  References trigger replacement in the following conditions:
+
   - If the reference is to a resource with multiple instances, a plan to
     update or replace any instance will trigger replacement.
   - If the reference is to a single resource instance, a plan to update or
@@ -120,20 +127,24 @@ References trigger replacement in the following conditions:
   - If the reference is to a single attribute of a resource instance, any
     change to the attribute value will trigger replacement.
 
-  You can only reference managed resources in `replace_triggered_by` expressions. This lets you modify these expressions without forcing replacement.
+  You can only reference managed resources in `replace_triggered_by`
+  expressions. This lets you modify these expressions without forcing
+  replacement.
 
   ```hcl
   resource "aws_appautoscaling_target" "ecs_target" {
     # ...
     lifecycle {
       replace_triggered_by = [
-        # Replace `aws_appautoscaling_target` each time this instance of 
+        # Replace `aws_appautoscaling_target` each time this instance of
         # the `aws_ecs_service` is replaced.
         aws_ecs_service.svc.id
       ]
     }
   }
   ```
+
+  `replace_triggered_by` allows only resource addresses because the decision is based on the planned actions for all of the given resources. Plain values such as local values or input variables do not have planned actions of their own, but you can treat them with a resource-like lifecycle by using them with [the `terraform_data` resource type](/terraform/language/resources/terraform-data).
 
 ## Custom Condition Checks
 
@@ -157,7 +168,7 @@ resource "aws_instance" "example" {
 
 Custom conditions can help capture assumptions, helping future maintainers understand the configuration design and intent. They also return useful information about errors earlier and in context, helping consumers more easily diagnose issues in their configurations.
 
-Refer to [Custom Conditions](/language/expressions/custom-conditions#preconditions-and-postconditions) for more details.
+Refer to [Custom Conditions](/terraform/language/expressions/custom-conditions#preconditions-and-postconditions) for more details.
 
 ## Literal Values Only
 

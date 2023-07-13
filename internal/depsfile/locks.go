@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package depsfile
 
 import (
@@ -401,6 +404,30 @@ func (l *ProviderLock) VersionConstraints() getproviders.VersionConstraints {
 // Do not modify the backing array of the returned slice.
 func (l *ProviderLock) AllHashes() []getproviders.Hash {
 	return l.hashes
+}
+
+// ContainsAll returns true if the hashes in this ProviderLock contains
+// all the hashes in the target.
+//
+// This function assumes the hashes are in each ProviderLock are sorted.
+// If the ProviderLock was created by the NewProviderLock constructor then
+// the hashes are guaranteed to be sorted.
+func (l *ProviderLock) ContainsAll(target *ProviderLock) bool {
+	if target == nil || len(target.hashes) == 0 {
+		return true
+	}
+
+	targetIndex := 0
+	for ix := 0; ix < len(l.hashes); ix++ {
+		if l.hashes[ix] == target.hashes[targetIndex] {
+			targetIndex++
+
+			if targetIndex >= len(target.hashes) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PreferredHashes returns a filtered version of the AllHashes return value

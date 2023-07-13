@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package terraform
 
 import (
@@ -8,7 +11,6 @@ import (
 	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"github.com/zclconf/go-cty/cty/msgpack"
 
-	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/configs/hcl2shim"
 	"github.com/hashicorp/terraform/internal/providers"
 )
@@ -109,31 +111,6 @@ func (p *MockProvider) getProviderSchema() providers.GetProviderSchemaResponse {
 	}
 }
 
-// ProviderSchema is a helper to convert from the internal GetProviderSchemaResponse to
-// a ProviderSchema.
-func (p *MockProvider) ProviderSchema() *ProviderSchema {
-	resp := p.getProviderSchema()
-
-	schema := &ProviderSchema{
-		Provider:                   resp.Provider.Block,
-		ProviderMeta:               resp.ProviderMeta.Block,
-		ResourceTypes:              map[string]*configschema.Block{},
-		DataSources:                map[string]*configschema.Block{},
-		ResourceTypeSchemaVersions: map[string]uint64{},
-	}
-
-	for resType, s := range resp.ResourceTypes {
-		schema.ResourceTypes[resType] = s.Block
-		schema.ResourceTypeSchemaVersions[resType] = uint64(s.Version)
-	}
-
-	for dataSource, s := range resp.DataSources {
-		schema.DataSources[dataSource] = s.Block
-	}
-
-	return schema
-}
-
 func (p *MockProvider) ValidateProviderConfig(r providers.ValidateProviderConfigRequest) (resp providers.ValidateProviderConfigResponse) {
 	p.Lock()
 	defer p.Unlock()
@@ -217,6 +194,11 @@ func (p *MockProvider) ValidateDataResourceConfig(r providers.ValidateDataResour
 func (p *MockProvider) UpgradeResourceState(r providers.UpgradeResourceStateRequest) (resp providers.UpgradeResourceStateResponse) {
 	p.Lock()
 	defer p.Unlock()
+
+	if !p.ConfigureProviderCalled {
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("Configure not called before UpgradeResourceState %q", r.TypeName))
+		return resp
+	}
 
 	schema, ok := p.getProviderSchema().ResourceTypes[r.TypeName]
 	if !ok {
@@ -351,6 +333,13 @@ func (p *MockProvider) PlanResourceChange(r providers.PlanResourceChangeRequest)
 		return *p.PlanResourceChangeResponse
 	}
 
+	// this is a destroy plan,
+	if r.ProposedNewState.IsNull() {
+		resp.PlannedState = r.ProposedNewState
+		resp.PlannedPrivate = r.PriorPrivate
+		return resp
+	}
+
 	schema, ok := p.getProviderSchema().ResourceTypes[r.TypeName]
 	if !ok {
 		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("no schema found for %q", r.TypeName))
@@ -423,28 +412,16 @@ func (p *MockProvider) ApplyResourceChange(r providers.ApplyResourceChangeReques
 		return *p.ApplyResourceChangeResponse
 	}
 
-	schema, ok := p.getProviderSchema().ResourceTypes[r.TypeName]
-	if !ok {
-		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("no schema found for %q", r.TypeName))
-		return resp
-	}
-
 	// if the value is nil, we return that directly to correspond to a delete
 	if r.PlannedState.IsNull() {
-		resp.NewState = cty.NullVal(schema.Block.ImpliedType())
-		return resp
-	}
-
-	val, err := schema.Block.CoerceValue(r.PlannedState)
-	if err != nil {
-		resp.Diagnostics = resp.Diagnostics.Append(err)
+		resp.NewState = r.PlannedState
 		return resp
 	}
 
 	// the default behavior will be to create the minimal valid apply value by
 	// setting unknowns (which correspond to computed attributes) to a zero
 	// value.
-	val, _ = cty.Transform(val, func(path cty.Path, v cty.Value) (cty.Value, error) {
+	val, _ := cty.Transform(r.PlannedState, func(path cty.Path, v cty.Value) (cty.Value, error) {
 		if !v.IsKnown() {
 			ty := v.Type()
 			switch {
@@ -534,6 +511,9 @@ func (p *MockProvider) ReadDataSource(r providers.ReadDataSourceRequest) (resp p
 }
 
 func (p *MockProvider) Close() error {
+	p.Lock()
+	defer p.Unlock()
+
 	p.CloseCalled = true
 	return p.CloseError
 }

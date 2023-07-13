@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package configs
 
 import (
@@ -156,8 +159,8 @@ func (p *Provider) moduleUniqueKey() string {
 // that can be successfully parsed as compact relative provider configuration
 // addresses:
 //
-//     aws
-//     aws.foo
+//   - aws
+//   - aws.foo
 //
 // This function will panic if given a relative traversal.
 //

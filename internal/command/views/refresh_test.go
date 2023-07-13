@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package views
 
 import (
@@ -98,7 +101,6 @@ func TestRefreshJSON_outputs(t *testing.T) {
 				},
 				"password": map[string]interface{}{
 					"sensitive": true,
-					"value":     "horse-battery",
 					"type":      "string",
 				},
 			},

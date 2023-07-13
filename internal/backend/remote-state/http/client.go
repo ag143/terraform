@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package http
 
 import (
@@ -100,14 +103,23 @@ func (c *httpClient) Lock(info *statemgr.LockInfo) (string, error) {
 		defer resp.Body.Close()
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			return "", fmt.Errorf("HTTP remote state already locked, failed to read body")
+			return "", &statemgr.LockError{
+				Info: info,
+				Err:  fmt.Errorf("HTTP remote state already locked, failed to read body"),
+			}
 		}
 		existing := statemgr.LockInfo{}
 		err = json.Unmarshal(body, &existing)
 		if err != nil {
-			return "", fmt.Errorf("HTTP remote state already locked, failed to unmarshal body")
+			return "", &statemgr.LockError{
+				Info: info,
+				Err:  fmt.Errorf("HTTP remote state already locked, failed to unmarshal body"),
+			}
 		}
-		return "", fmt.Errorf("HTTP remote state already locked: ID=%s", existing.ID)
+		return "", &statemgr.LockError{
+			Info: info,
+			Err:  fmt.Errorf("HTTP remote state already locked: ID=%s", existing.ID),
+		}
 	default:
 		return "", fmt.Errorf("Unexpected HTTP response code %d", resp.StatusCode)
 	}

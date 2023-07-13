@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package remote
 
 import (
@@ -76,6 +79,9 @@ func TestRemoteLocks(t *testing.T, a, b Client) {
 	if err == nil {
 		lockerA.Unlock(lockIDA)
 		t.Fatal("client B obtained lock while held by client A")
+	}
+	if _, ok := err.(*statemgr.LockError); !ok {
+		t.Errorf("expected a LockError, but was %t: %s", err, err)
 	}
 
 	if err := lockerA.Unlock(lockIDA); err != nil {

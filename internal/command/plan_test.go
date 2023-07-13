@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package command
 
 import (
@@ -18,6 +21,7 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	backendinit "github.com/hashicorp/terraform/internal/backend/init"
+	"github.com/hashicorp/terraform/internal/checks"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
@@ -189,6 +193,47 @@ func TestPlan_noState(t *testing.T) {
 	}
 }
 
+func TestPlan_generatedConfigPath(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("plan-import-config-gen"), td)
+	defer testChdir(t, td)()
+
+	genPath := filepath.Join(td, "generated.tf")
+
+	p := planFixtureProvider()
+	view, done := testView(t)
+
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	p.ImportResourceStateResponse = &providers.ImportResourceStateResponse{
+		ImportedResources: []providers.ImportedResource{
+			{
+				TypeName: "test_instance",
+				State: cty.ObjectVal(map[string]cty.Value{
+					"id": cty.StringVal("bar"),
+				}),
+				Private: nil,
+			},
+		},
+	}
+
+	args := []string{
+		"-generate-config-out", genPath,
+	}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
+	}
+
+	testFileEquals(t, genPath, filepath.Join(td, "generated.tf.expected"))
+}
+
 func TestPlan_outPath(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath("plan"), td)
@@ -272,6 +317,54 @@ func TestPlan_outPathNoChange(t *testing.T) {
 	plan := testReadPlan(t, outPath)
 	if !plan.Changes.Empty() {
 		t.Fatalf("Expected empty plan to be written to plan file, got: %s", spew.Sdump(plan))
+	}
+}
+
+func TestPlan_outPathWithError(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("plan-fail-condition"), td)
+	defer testChdir(t, td)()
+
+	outPath := filepath.Join(td, "test.plan")
+
+	p := planFixtureProvider()
+	view, done := testView(t)
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	p.PlanResourceChangeResponse = &providers.PlanResourceChangeResponse{
+		PlannedState: cty.NullVal(cty.EmptyObject),
+	}
+
+	args := []string{
+		"-out", outPath,
+	}
+	code := c.Run(args)
+	output := done(t)
+	if code == 0 {
+		t.Fatal("expected non-zero exit status", output)
+	}
+
+	plan := testReadPlan(t, outPath) // will call t.Fatal itself if the file cannot be read
+	if !plan.Errored {
+		t.Fatal("plan should be marked with Errored")
+	}
+
+	if plan.Checks == nil {
+		t.Fatal("plan contains no checks")
+	}
+
+	// the checks should only contain one failure
+	results := plan.Checks.ConfigResults.Elements()
+	if len(results) != 1 {
+		t.Fatal("incorrect number of check results", len(results))
+	}
+	if results[0].Value.Status != checks.StatusFail {
+		t.Errorf("incorrect status, got %s", results[0].Value.Status)
 	}
 }
 
@@ -379,7 +472,7 @@ func TestPlan_outBackend(t *testing.T) {
 func TestPlan_refreshFalse(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := t.TempDir()
-	testCopyDir(t, testFixturePath("plan"), td)
+	testCopyDir(t, testFixturePath("plan-existing-state"), td)
 	defer testChdir(t, td)()
 
 	p := planFixtureProvider()
@@ -402,6 +495,71 @@ func TestPlan_refreshFalse(t *testing.T) {
 
 	if p.ReadResourceCalled {
 		t.Fatal("ReadResource should not have been called")
+	}
+}
+
+func TestPlan_refreshTrue(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("plan-existing-state"), td)
+	defer testChdir(t, td)()
+
+	p := planFixtureProvider()
+	view, done := testView(t)
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	args := []string{
+		"-refresh=true",
+	}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
+	}
+
+	if !p.ReadResourceCalled {
+		t.Fatalf("ReadResource should have been called")
+	}
+}
+
+// A consumer relies on the fact that running
+// terraform plan -refresh=false -refresh=true gives the same result as
+// terraform plan -refresh=true.
+// While the flag logic itself is handled by the stdlib flags package (and code
+// in main() that is tested elsewhere), we verify the overall plan command
+// behaviour here in case we accidentally break this with additional logic.
+func TestPlan_refreshFalseRefreshTrue(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("plan-existing-state"), td)
+	defer testChdir(t, td)()
+
+	p := planFixtureProvider()
+	view, done := testView(t)
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	args := []string{
+		"-refresh=false",
+		"-refresh=true",
+	}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
+	}
+
+	if !p.ReadResourceCalled {
+		t.Fatal("ReadResource should have been called")
 	}
 }
 
@@ -437,10 +595,10 @@ func TestPlan_state(t *testing.T) {
 	expected := cty.ObjectVal(map[string]cty.Value{
 		"id":  cty.StringVal("bar"),
 		"ami": cty.NullVal(cty.String),
-		"network_interface": cty.NullVal(cty.List(cty.Object(map[string]cty.Type{
+		"network_interface": cty.ListValEmpty(cty.Object(map[string]cty.Type{
 			"device_index": cty.String,
 			"description":  cty.String,
-		}))),
+		})),
 	})
 	if !expected.RawEquals(actual) {
 		t.Fatalf("wrong prior state\ngot:  %#v\nwant: %#v", actual, expected)
@@ -479,10 +637,10 @@ func TestPlan_stateDefault(t *testing.T) {
 	expected := cty.ObjectVal(map[string]cty.Value{
 		"id":  cty.StringVal("bar"),
 		"ami": cty.NullVal(cty.String),
-		"network_interface": cty.NullVal(cty.List(cty.Object(map[string]cty.Type{
+		"network_interface": cty.ListValEmpty(cty.Object(map[string]cty.Type{
 			"device_index": cty.String,
 			"description":  cty.String,
-		}))),
+		})),
 	})
 	if !expected.RawEquals(actual) {
 		t.Fatalf("wrong prior state\ngot:  %#v\nwant: %#v", actual, expected)
@@ -575,6 +733,51 @@ func TestPlan_vars(t *testing.T) {
 	}
 }
 
+func TestPlan_varsInvalid(t *testing.T) {
+	testCases := []struct {
+		args    []string
+		wantErr string
+	}{
+		{
+			[]string{"-var", "foo"},
+			`The given -var option "foo" is not correctly specified.`,
+		},
+		{
+			[]string{"-var", "foo = bar"},
+			`Variable name "foo " is invalid due to trailing space.`,
+		},
+	}
+
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("plan-vars"), td)
+	defer testChdir(t, td)()
+
+	for _, tc := range testCases {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			p := planVarsFixtureProvider()
+			view, done := testView(t)
+			c := &PlanCommand{
+				Meta: Meta{
+					testingOverrides: metaOverridesForProvider(p),
+					View:             view,
+				},
+			}
+
+			code := c.Run(tc.args)
+			output := done(t)
+			if code != 1 {
+				t.Fatalf("bad: %d\n\n%s", code, output.Stdout())
+			}
+
+			got := output.Stderr()
+			if !strings.Contains(got, tc.wantErr) {
+				t.Fatalf("bad error output, want %q, got:\n%s", tc.wantErr, got)
+			}
+		})
+	}
+}
+
 func TestPlan_varsUnset(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := t.TempDir()
@@ -650,6 +853,22 @@ func TestPlan_providerArgumentUnset(t *testing.T) {
 									"description":  {Type: cty.String, Optional: true},
 								},
 							},
+						},
+					},
+				},
+			},
+		},
+		DataSources: map[string]providers.Schema{
+			"test_data_source": {
+				Block: &configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"id": {
+							Type:     cty.String,
+							Required: true,
+						},
+						"valid": {
+							Type:     cty.Bool,
+							Computed: true,
 						},
 					},
 				},
@@ -1337,6 +1556,33 @@ func TestPlan_warnings(t *testing.T) {
 	})
 }
 
+func TestPlan_jsonGoldenReference(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer testChdir(t, td)()
+
+	p := planFixtureProvider()
+	view, done := testView(t)
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	args := []string{
+		"-json",
+	}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
+	}
+
+	checkGoldenReference(t, output, "plan")
+}
+
 // planFixtureSchema returns a schema suitable for processing the
 // configuration in testdata/plan . This schema should be
 // assigned to a mock provider named "test".
@@ -1363,6 +1609,22 @@ func planFixtureSchema() *providers.GetProviderSchemaResponse {
 				},
 			},
 		},
+		DataSources: map[string]providers.Schema{
+			"test_data_source": {
+				Block: &configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"id": {
+							Type:     cty.String,
+							Required: true,
+						},
+						"valid": {
+							Type:     cty.Bool,
+							Computed: true,
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -1376,6 +1638,14 @@ func planFixtureProvider() *terraform.MockProvider {
 	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
 		return providers.PlanResourceChangeResponse{
 			PlannedState: req.ProposedNewState,
+		}
+	}
+	p.ReadDataSourceFn = func(req providers.ReadDataSourceRequest) providers.ReadDataSourceResponse {
+		return providers.ReadDataSourceResponse{
+			State: cty.ObjectVal(map[string]cty.Value{
+				"id":    cty.StringVal("zzzzz"),
+				"valid": cty.BoolVal(true),
+			}),
 		}
 	}
 	return p
@@ -1411,6 +1681,14 @@ func planVarsFixtureProvider() *terraform.MockProvider {
 			PlannedState: req.ProposedNewState,
 		}
 	}
+	p.ReadDataSourceFn = func(req providers.ReadDataSourceRequest) providers.ReadDataSourceResponse {
+		return providers.ReadDataSourceResponse{
+			State: cty.ObjectVal(map[string]cty.Value{
+				"id":    cty.StringVal("zzzzz"),
+				"valid": cty.BoolVal(true),
+			}),
+		}
+	}
 	return p
 }
 
@@ -1428,6 +1706,14 @@ func planWarningsFixtureProvider() *terraform.MockProvider {
 				tfdiags.SimpleWarning("warning 3"),
 			},
 			PlannedState: req.ProposedNewState,
+		}
+	}
+	p.ReadDataSourceFn = func(req providers.ReadDataSourceRequest) providers.ReadDataSourceResponse {
+		return providers.ReadDataSourceResponse{
+			State: cty.ObjectVal(map[string]cty.Value{
+				"id":    cty.StringVal("zzzzz"),
+				"valid": cty.BoolVal(true),
+			}),
 		}
 	}
 	return p

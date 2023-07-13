@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package terraform
 
 import (
@@ -15,8 +18,6 @@ import (
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/zclconf/go-cty/cty"
-
-	_ "github.com/hashicorp/terraform/internal/logging"
 )
 
 // InputMode defines what sort of input will be asked for when Input
@@ -145,13 +146,6 @@ func NewContext(opts *ContextOpts) (*Context, tfdiags.Diagnostics) {
 }
 
 func (c *Context) Schemas(config *configs.Config, state *states.State) (*Schemas, tfdiags.Diagnostics) {
-	// TODO: This method gets called multiple times on the same context with
-	// the same inputs by different parts of Terraform that all need the
-	// schemas, and it's typically quite expensive because it has to spin up
-	// plugins to gather their schemas, so it'd be good to have some caching
-	// here to remember plugin schemas we already loaded since the plugin
-	// selections can't change during the life of a *Context object.
-
 	var diags tfdiags.Diagnostics
 
 	ret, err := loadSchemas(config, state, c.plugins)
@@ -193,6 +187,12 @@ func (c *Context) Stop() {
 		// Stop the context
 		c.runContextCancel()
 		c.runContextCancel = nil
+	}
+
+	// Notify all of the hooks that we're stopping, in case they want to try
+	// to flush in-memory state to disk before a subsequent hard kill.
+	for _, hook := range c.hooks {
+		hook.Stopping()
 	}
 
 	// Grab the condition var before we exit

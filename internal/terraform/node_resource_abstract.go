@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package terraform
 
 import (
@@ -68,6 +71,17 @@ type NodeAbstractResource struct {
 
 	// The address of the provider this resource will use
 	ResolvedProvider addrs.AbsProviderConfig
+	// storedProviderConfig is the provider address retrieved from the
+	// state. This is defined here for access within the ProvidedBy method, but
+	// will be set from the embedding instance type when the state is attached.
+	storedProviderConfig addrs.AbsProviderConfig
+
+	// This resource may expand into instances which need to be imported.
+	importTargets []*ImportTarget
+
+	// generateConfigPath tells this node which file to write generated config
+	// into. If empty, then config should not be generated.
+	generateConfigPath string
 }
 
 var (
@@ -138,25 +152,25 @@ func (n *NodeAbstractResource) References() []*addrs.Reference {
 			log.Printf("[WARN] no schema is attached to %s, so config references cannot be detected", n.Name())
 		}
 
-		refs, _ := lang.ReferencesInExpr(c.Count)
+		refs, _ := lang.ReferencesInExpr(addrs.ParseRef, c.Count)
 		result = append(result, refs...)
-		refs, _ = lang.ReferencesInExpr(c.ForEach)
+		refs, _ = lang.ReferencesInExpr(addrs.ParseRef, c.ForEach)
 		result = append(result, refs...)
 
 		for _, expr := range c.TriggersReplacement {
-			refs, _ = lang.ReferencesInExpr(expr)
+			refs, _ = lang.ReferencesInExpr(addrs.ParseRef, expr)
 			result = append(result, refs...)
 		}
 
 		// ReferencesInBlock() requires a schema
 		if n.Schema != nil {
-			refs, _ = lang.ReferencesInBlock(c.Config, n.Schema)
+			refs, _ = lang.ReferencesInBlock(addrs.ParseRef, c.Config, n.Schema)
 			result = append(result, refs...)
 		}
 
 		if c.Managed != nil {
 			if c.Managed.Connection != nil {
-				refs, _ = lang.ReferencesInBlock(c.Managed.Connection.Config, connectionBlockSupersetSchema)
+				refs, _ = lang.ReferencesInBlock(addrs.ParseRef, c.Managed.Connection.Config, connectionBlockSupersetSchema)
 				result = append(result, refs...)
 			}
 
@@ -165,7 +179,7 @@ func (n *NodeAbstractResource) References() []*addrs.Reference {
 					continue
 				}
 				if p.Connection != nil {
-					refs, _ = lang.ReferencesInBlock(p.Connection.Config, connectionBlockSupersetSchema)
+					refs, _ = lang.ReferencesInBlock(addrs.ParseRef, p.Connection.Config, connectionBlockSupersetSchema)
 					result = append(result, refs...)
 				}
 
@@ -173,21 +187,21 @@ func (n *NodeAbstractResource) References() []*addrs.Reference {
 				if schema == nil {
 					log.Printf("[WARN] no schema for provisioner %q is attached to %s, so provisioner block references cannot be detected", p.Type, n.Name())
 				}
-				refs, _ = lang.ReferencesInBlock(p.Config, schema)
+				refs, _ = lang.ReferencesInBlock(addrs.ParseRef, p.Config, schema)
 				result = append(result, refs...)
 			}
 		}
 
 		for _, check := range c.Preconditions {
-			refs, _ := lang.ReferencesInExpr(check.Condition)
+			refs, _ := lang.ReferencesInExpr(addrs.ParseRef, check.Condition)
 			result = append(result, refs...)
-			refs, _ = lang.ReferencesInExpr(check.ErrorMessage)
+			refs, _ = lang.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
 			result = append(result, refs...)
 		}
 		for _, check := range c.Postconditions {
-			refs, _ := lang.ReferencesInExpr(check.Condition)
+			refs, _ := lang.ReferencesInExpr(addrs.ParseRef, check.Condition)
 			result = append(result, refs...)
-			refs, _ = lang.ReferencesInExpr(check.ErrorMessage)
+			refs, _ = lang.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
 			result = append(result, refs...)
 		}
 
@@ -224,6 +238,11 @@ func (n *NodeAbstractResource) SetProvider(p addrs.AbsProviderConfig) {
 
 // GraphNodeProviderConsumer
 func (n *NodeAbstractResource) ProvidedBy() (addrs.ProviderConfig, bool) {
+	// Once the provider is fully resolved, we can return the known value.
+	if n.ResolvedProvider.Provider.Type != "" {
+		return n.ResolvedProvider, true
+	}
+
 	// If we have a config we prefer that above all else
 	if n.Config != nil {
 		relAddr := n.Config.ProviderConfigAddr()
@@ -231,6 +250,29 @@ func (n *NodeAbstractResource) ProvidedBy() (addrs.ProviderConfig, bool) {
 			LocalName: relAddr.LocalName,
 			Alias:     relAddr.Alias,
 		}, false
+	}
+
+	// See if we have a valid provider config from the state.
+	if n.storedProviderConfig.Provider.Type != "" {
+		// An address from the state must match exactly, since we must ensure
+		// we refresh/destroy a resource with the same provider configuration
+		// that created it.
+		return n.storedProviderConfig, true
+	}
+
+	// We might have an import target that is providing a specific provider,
+	// this is okay as we know there is nothing else potentially providing a
+	// provider configuration.
+	if len(n.importTargets) > 0 {
+		// The import targets should either all be defined via config or none
+		// of them should be. They should also all have the same provider, so it
+		// shouldn't matter which we check here, as they'll all give the same.
+		if n.importTargets[0].Config != nil && n.importTargets[0].Config.ProviderConfigRef != nil {
+			return addrs.LocalProviderConfig{
+				LocalName: n.importTargets[0].Config.ProviderConfigRef.Name,
+				Alias:     n.importTargets[0].Config.ProviderConfigRef.Alias,
+			}, false
+		}
 	}
 
 	// No provider configuration found; return a default address
@@ -245,6 +287,19 @@ func (n *NodeAbstractResource) Provider() addrs.Provider {
 	if n.Config != nil {
 		return n.Config.Provider
 	}
+	if n.storedProviderConfig.Provider.Type != "" {
+		return n.storedProviderConfig.Provider
+	}
+
+	if len(n.importTargets) > 0 {
+		// The import targets should either all be defined via config or none
+		// of them should be. They should also all have the same provider, so it
+		// shouldn't matter which we check here, as they'll all give the same.
+		if n.importTargets[0].Config != nil {
+			return n.importTargets[0].Config.Provider
+		}
+	}
+
 	return addrs.ImpliedProviderForUnqualifiedType(n.Addr.Resource.ImpliedProvider())
 }
 
@@ -334,7 +389,7 @@ func (n *NodeAbstractResource) writeResourceState(ctx EvalContext, addr addrs.Ab
 	expander := ctx.InstanceExpander()
 
 	switch {
-	case n.Config.Count != nil:
+	case n.Config != nil && n.Config.Count != nil:
 		count, countDiags := evaluateCountExpression(n.Config.Count, ctx)
 		diags = diags.Append(countDiags)
 		if countDiags.HasErrors() {
@@ -344,7 +399,7 @@ func (n *NodeAbstractResource) writeResourceState(ctx EvalContext, addr addrs.Ab
 		state.SetResourceProvider(addr, n.ResolvedProvider)
 		expander.SetResourceCount(addr.Module, n.Addr.Resource, count)
 
-	case n.Config.ForEach != nil:
+	case n.Config != nil && n.Config.ForEach != nil:
 		forEach, forEachDiags := evaluateForEachExpression(n.Config.ForEach, ctx)
 		diags = diags.Append(forEachDiags)
 		if forEachDiags.HasErrors() {
@@ -459,16 +514,16 @@ func (n *NodeAbstractResource) readResourceInstanceStateDeposed(ctx EvalContext,
 // graphNodesAreResourceInstancesInDifferentInstancesOfSameModule is an
 // annoyingly-task-specific helper function that returns true if and only if
 // the following conditions hold:
-// - Both of the given vertices represent specific resource instances, as
-//   opposed to unexpanded resources or any other non-resource-related object.
-// - The module instance addresses for both of the resource instances belong
-//   to the same static module.
-// - The module instance addresses for both of the resource instances are
-//   not equal, indicating that they belong to different instances of the
-//   same module.
+//   - Both of the given vertices represent specific resource instances, as
+//     opposed to unexpanded resources or any other non-resource-related object.
+//   - The module instance addresses for both of the resource instances belong
+//     to the same static module.
+//   - The module instance addresses for both of the resource instances are
+//     not equal, indicating that they belong to different instances of the
+//     same module.
 //
 // This result can be used as a way to compensate for the effects of
-// conservative analyses passes in our graph builders which make their
+// conservative analysis passes in our graph builders which make their
 // decisions based only on unexpanded addresses, often so that they can behave
 // correctly for interactions between expanded and not-yet-expanded objects.
 //
